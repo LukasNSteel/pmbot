@@ -14,6 +14,7 @@ log = logging.getLogger("pmbot.risk")
 
 class RiskAction(Enum):
     OK = "ok"
+    PAUSE_QUOTES = "pause_quotes"  # cancel quotes until risk state is healthy
     PAUSE_DAY = "pause_day"  # cancel quotes, resume next UTC day
     KILL = "kill"  # cancel everything and exit
 
@@ -47,7 +48,8 @@ class RiskManager:
     def check(self, equity: float, total_inventory_usd: float,
               scale: float = 1.0) -> RiskAction:
         if equity != equity:
-            return RiskAction.OK
+            log.warning("equity unknown — pausing quotes until balance/positions refresh")
+            return RiskAction.PAUSE_QUOTES
         if self.day_start_equity != self.day_start_equity:
             self.day_start_equity = equity
             log.info("equity baseline set: $%.2f", equity)
@@ -76,8 +78,9 @@ class RiskManager:
             return RiskAction.PAUSE_DAY
 
         if total_inventory_usd > self.cfg["max_total_inventory_usd"] * scale:
-            log.warning("total inventory $%.0f over cap — quoting reduce-only",
+            log.warning("total inventory $%.0f over cap — pausing new quotes",
                         total_inventory_usd)
+            return RiskAction.PAUSE_QUOTES
         return RiskAction.OK
 
     def market_inventory_ok(self, net_exposure_usd: float, cap: float | None = None) -> bool:

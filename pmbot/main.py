@@ -269,7 +269,7 @@ class Bot:
                 if action == RiskAction.KILL:
                     break
 
-                if action == RiskAction.PAUSE_DAY:
+                if action in (RiskAction.PAUSE_DAY, RiskAction.PAUSE_QUOTES):
                     if not self._was_paused:
                         await self._broker_call(self.broker.cancel_quotes)
                         self._was_paused = True
@@ -506,14 +506,26 @@ class Bot:
                     updates.append((m, []))
                 continue
             yes_book = self.tracker.books[m.yes_token]
+            no_book = self.tracker.books[m.no_token]
             if yes_book.mid is not None:
                 self.guards.record_mid(m.condition_id, yes_book.mid, now, m.question)
-            freshness = max(self.tracker.last_msg_ts, yes_book.updated_ts)
-            if now - freshness > max_stale:
+            oldest_book_update = min(yes_book.updated_ts, no_book.updated_ts)
+            if now - oldest_book_update > max_stale:
                 self.metrics.sample_uptime(m.condition_id, False)
                 if self.broker.open_quotes(m):
-                    log.warning("feed stale %.0fs — pulling quotes from '%s'",
-                                now - freshness, m.question[:45])
+                    log.warning("book stale %.0fs — pulling quotes from '%s'",
+                                now - oldest_book_update, m.question[:45])
+                    updates.append((m, []))
+                continue
+            band = m.max_spread_cents / 100.0
+            max_spread_mult = float(
+                self.cfg["quoting"].get("max_book_spread_mult_of_band", 3.0))
+            if (not strategy.book_is_quotable(yes_book, band, max_spread_mult)
+                    or not strategy.book_is_quotable(no_book, band, max_spread_mult)):
+                self.metrics.sample_uptime(m.condition_id, False)
+                if self.broker.open_quotes(m):
+                    log.warning("book not quotable on both sides — pulling '%s'",
+                                m.question[:45])
                     updates.append((m, []))
                 continue
             if not self.guards.allow(m.condition_id, now):

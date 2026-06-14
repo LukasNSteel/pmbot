@@ -1,10 +1,17 @@
 """Tests for broker fill models and live order diff."""
 
 import time
+import threading
 from unittest.mock import MagicMock
 
 from pmbot.books import Book, BookTracker
-from pmbot.brokers import LiveBroker, PaperBroker, Position, _parse_fill_amount
+from pmbot.brokers import (
+    LiveBroker,
+    PaperBroker,
+    Position,
+    _parse_erc20_balance,
+    _parse_fill_amount,
+)
 from pmbot.gamma import Market
 from pmbot.strategy import Quote
 
@@ -24,6 +31,10 @@ def test_parse_fill_amount_from_taking_amount():
 
 def test_parse_fill_amount_zero_on_error():
     assert _parse_fill_amount({"success": False, "error": "rejected"}, 10.0) == 0.0
+
+
+def test_parse_erc20_balance_uses_six_decimals():
+    assert _parse_erc20_balance(hex(100_512_253)) == 100.512253
 
 
 def test_paper_queue_consumes_ahead_before_fill():
@@ -226,3 +237,42 @@ def test_apply_fill_sell_decrements_exit_order():
     assert stub._exit_orders["cid1"].quote.size == 5.0
     LiveBroker._apply_fill_to_orders(stub, "yes1", 5.0, "SELL")
     assert "cid1" not in stub._exit_orders
+
+
+def test_cancel_quotes_keeps_local_state_when_cancel_fails():
+    from pmbot.brokers import RestingOrder
+
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.client.cancel_orders.side_effect = RuntimeError("down")
+    stub.client.cancel_order.side_effect = RuntimeError("down")
+    stub.reconcile_orders = MagicMock()
+    stub._batch_cancel = lambda ids: LiveBroker._batch_cancel(stub, ids)
+    ro = RestingOrder("o1", Quote("yes1", 0.47, 10), time.time(), 0)
+    stub._open_orders = {"cid1": [ro]}
+
+    LiveBroker.cancel_quotes(stub)
+
+    assert stub._open_orders == {"cid1": [ro]}
+    stub.reconcile_orders.assert_called_once()
+
+
+def test_live_crossed_book_forces_reconcile_without_blocking():
+    """A crossed resting bid must flag a reconcile for the next off-thread
+    refresh, not call the network on the event loop."""
+    from pmbot.brokers import RestingOrder
+
+    tracker = BookTracker(["yes1"])
+    tracker.books["yes1"].asks = {0.46: 10.0}
+    stub = _order_book_stub()
+    stub.tracker = tracker
+    stub._last_order_reconcile = time.time()
+    stub.reconcile_orders = MagicMock()
+    stub._open_orders = {
+        "cid1": [RestingOrder("o1", Quote("yes1", 0.47, 10), time.time(), 0)]}
+
+    LiveBroker.check_crossed_books(stub)
+
+    stub.reconcile_orders.assert_not_called()
+    assert stub._last_order_reconcile == 0.0

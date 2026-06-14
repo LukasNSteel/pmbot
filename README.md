@@ -96,14 +96,30 @@ Ctrl-C always cancels all resting orders before exiting.
 ## Metrics & reporting
 
 All fills, quote changes, hedges, merges, equity snapshots, in-band uptime,
-and reward accrual are logged to SQLite (`data/metrics.db`).
+and reward accrual are logged to SQLite. The active paths are set in
+`config.yaml`:
 
-```bash
-python -m pmbot.main report
+```yaml
+metrics:
+  db_path: data/live_metrics.db
+  trades_log: data/live_trades.jsonl
 ```
 
-Shows daily PnL decomposition: spread capture (merges), hedge costs,
-estimated vs realized rewards, equity PnL, maker fill count, in-band uptime %.
+Report commands always read whichever metrics DB is configured:
+
+```bash
+python -m pmbot.main report       # daily PnL decomposition
+python -m pmbot.main performance  # per-market fills, hedges, markouts, uptime
+python -m pmbot.main trades       # recent fills from the active DB
+```
+
+For live trading, keep the live paths above so paper results in
+`data/metrics.db` do not mix with real-money fills. The `trades_log` JSONL is
+an append-only fill log alongside the SQLite DB.
+
+`report` shows spread capture (merged YES+NO pairs), hedge spend, estimated
+vs realized rewards, equity PnL, maker fill count, and in-band uptime.
+Estimated rewards are not banked cash until they appear as realized rewards.
 
 ## Going live
 
@@ -112,7 +128,8 @@ estimated vs realized rewards, equity PnL, maker fill count, in-band uptime %.
    - `POLYMARKET_FUNDER` — your Polymarket deposit address (profile page)
 2. Set `live.signature_type` in `config.yaml`: `1` for email/Magic login,
    `2` for browser-wallet login, `0` for a plain EOA trading directly
-3. Fund the account with USDC on Polygon
+3. Fund the account from Polymarket. Current Polymarket cash is held as pUSD
+   in the trading wallet/proxy shown on your profile.
 4. Set `mode: live` in `config.yaml` and run `python -m pmbot.main run`
 
 In live mode:
@@ -121,6 +138,8 @@ In live mode:
 - Open orders are reconciled against the exchange every ~30s
 - GTD orders self-expire on crash (90s dead-man switch)
 - Positions polled every ~12s with WS-fill delta reconciliation
+- Equity includes pUSD cash from `POLYMARKET_FUNDER` plus marked-to-market
+  YES/NO positions. This is what drives equity-scaled sizing and loss limits.
 - YES+NO pairs merged on-chain every ~60s (once `merge_min_pairs` accumulate)
 
 Start with a small `capital_usd` and watch the first sessions closely.

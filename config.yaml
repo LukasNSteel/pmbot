@@ -1,9 +1,9 @@
 # Polymarket market-making bot configuration.
 # mode: paper | live
-mode: paper
+mode: live
 
 # Total capital the bot is allowed to work with (USD).
-capital_usd: 500
+capital_usd: 100
 
 paper:
   # Simulated order placement/cancel latency. New quotes only become fillable
@@ -16,8 +16,12 @@ paper:
   reward_haircut: 0.7
 
 scanner:
-  # How many markets to quote simultaneously.
-  top_n_markets: 5
+  # How many markets to quote simultaneously. Keep this small relative to
+  # capital_usd: a two-sided quote locks ~`size` dollars of collateral per
+  # market (a filled YES+NO pair is worth $1), so N markets need ~N×size of
+  # free balance at once. At $100 capital, 1–2 markets is realistic; raise
+  # this only as you add capital.
+  top_n_markets: 2
   # Ignore markets whose daily reward pool is below this (USD/day).
   min_pool_per_day: 25
   # Ignore markets requiring quotes bigger than this (shares) — keeps
@@ -37,8 +41,11 @@ scanner:
   # Only quote markets whose midpoint is inside this range. Outside it,
   # rewards require two-sided depth anyway and tail risk is worse.
   mid_range: [0.15, 0.85]
-  # Skip markets resolving sooner than this many hours.
-  min_hours_to_end: 4
+  # Skip markets resolving sooner than this many hours. Keep this at or above
+  # risk.derisk_hours_before_end so freshly scanned markets aren't entered
+  # already inside the de-risk/exit window (which would quote them at a shrunk
+  # cap and widened spread for only a couple of hours before forced exit).
+  min_hours_to_end: 14
   # Re-run the scanner this often to rotate into fresh markets.
   refresh_minutes: 30
   # Skip markets whose question contains any of these (case-insensitive).
@@ -142,7 +149,7 @@ risk:
   # and the bot sizes up automatically; draw down and it sizes down. Clamped
   # so a bad mark or a single losing day can't whipsaw sizing. The dollar
   # values below are calibrated at capital_usd. Loss limits stay absolute.
-  scale_with_equity: true
+  scale_with_equity: false
   scale_min: 0.5
   scale_max: 10.0
   # Stop adding inventory in a market beyond this (USD at current prices).
@@ -197,6 +204,6 @@ live:
   rpc_url: https://polygon-bor-rpc.publicnode.com
 
 metrics:
-  db_path: data/metrics.db
+  db_path: data/live_metrics.db
   # Append-only JSONL of every fill — easy to grep, import into pandas, etc.
-  trades_log: data/trades.jsonl
+  trades_log: data/live_trades.jsonl

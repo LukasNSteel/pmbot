@@ -4,5 +4,5 @@ websockets
 pyyaml
 python-dotenv
 rich
-py-clob-client
+py-clob-client-v2
 pytest

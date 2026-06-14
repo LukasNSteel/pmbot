@@ -98,7 +98,7 @@ def _parse_market(m: dict) -> Market | None:
     )
 
 
-def _fetch_fee_bps(token_id: str, cache: dict[str, int]) -> int:
+def _fetch_fee_bps(token_id: str, cache: dict[str, int | None]) -> int | None:
     if token_id in cache:
         return cache[token_id]
     try:
@@ -106,8 +106,10 @@ def _fetch_fee_bps(token_id: str, cache: dict[str, int]) -> int:
             resp = client.get(f"{CLOB_URL}/fee-rate", params={"token_id": token_id})
             resp.raise_for_status()
             fee = int(resp.json().get("base_fee") or 0)
-    except Exception:  # noqa: BLE001
-        fee = 0
+    except Exception as e:  # noqa: BLE001
+        log.warning("fee-rate fetch failed for %s…; skipping market: %s",
+                    token_id[:12], e)
+        fee = None
     cache[token_id] = fee
     return fee
 
@@ -160,7 +162,7 @@ def scan(cfg: dict) -> list[Market]:
     fee_penalty = float(sc.get("fee_penalty_mult", 0.5))
     max_fee_bps = int(sc.get("max_fee_bps", 0))
 
-    fee_cache: dict[str, int] = {}
+    fee_cache: dict[str, int | None] = {}
     candidates = []
     for m in fetch_reward_markets():
         if m.daily_pool < sc["min_pool_per_day"]:
@@ -177,7 +179,10 @@ def scan(cfg: dict) -> list[Market]:
             continue
         if m.min_size * 1.0 > max_capital:
             continue
-        m.fee_bps = _fetch_fee_bps(m.yes_token, fee_cache)
+        fee_bps = _fetch_fee_bps(m.yes_token, fee_cache)
+        if fee_bps is None:
+            continue
+        m.fee_bps = fee_bps
         if m.fee_bps > max_fee_bps:
             # At 1000bps a fill at mid 0.50 costs 5c/share — more than the
             # whole reward band. Fee markets are unquotable for this strategy.

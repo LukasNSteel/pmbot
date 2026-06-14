@@ -57,6 +57,18 @@ def test_risk_manager_smoothed_equity_delays_trip():
     assert rm.check(470.0, 0) == RiskAction.OK
 
 
+def test_risk_manager_pauses_when_equity_unknown():
+    from pmbot.risk import RiskAction
+    rm = RiskManager(CFG, 500.0)
+    assert rm.check(float("nan"), 0) == RiskAction.PAUSE_QUOTES
+
+
+def test_risk_manager_pauses_when_total_inventory_over_cap():
+    from pmbot.risk import RiskAction
+    rm = RiskManager(CFG, 500.0)
+    assert rm.check(500.0, 251.0) == RiskAction.PAUSE_QUOTES
+
+
 def test_market_themes_includes_event_id():
     rm = RiskManager(CFG, 500.0)
     m = _market(event_id="evt-123")

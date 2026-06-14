@@ -1,5 +1,5 @@
 """Brokers: PaperBroker (fill simulation, positions, PnL) and LiveBroker
-(py-clob-client wrapper). Both expose the same interface."""
+(py-clob-client-v2 wrapper). Both expose the same interface."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ ORDER_RECONCILE_SECONDS = 30.0
 # must sign expiration=now+ttl+60 and refresh well before T-60.
 GTD_SECURITY_THRESHOLD_SECS = 60
 GTD_REFRESH_MARGIN_SECS = GTD_SECURITY_THRESHOLD_SECS + 30
+PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+USDC_DECIMALS = 1_000_000
 
 
 @dataclass
@@ -80,6 +82,12 @@ def _parse_fill_amount(resp: dict, requested: float) -> float:
     if status in ("MATCHED", "FILLED", "LIVE"):
         return requested
     return 0.0
+
+
+def _parse_erc20_balance(result: str | None) -> float:
+    if not result:
+        raise ValueError("empty eth_call result")
+    return int(result, 16) / USDC_DECIMALS
 
 
 class PaperBroker:
@@ -480,14 +488,14 @@ class PaperBroker:
 
 
 class LiveBroker:
-    """Real order placement through py-clob-client."""
+    """Real order placement through py-clob-client-v2 (CLOB V2)."""
 
     HOST = "https://clob.polymarket.com"
     DATA_API = "https://data-api.polymarket.com"
     CHAIN_ID = 137
 
     def __init__(self, cfg: dict, tracker: BookTracker):
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2 import ClobClient
 
         key = os.environ.get("POLYMARKET_PRIVATE_KEY") or ""
         funder = os.environ.get("POLYMARKET_FUNDER") or None
@@ -498,14 +506,21 @@ class LiveBroker:
             )
         self.cfg = cfg
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
+        self.rpc_url = cfg["live"].get("rpc_url")
         sig_type = int(cfg["live"]["signature_type"])
+        if sig_type == 1 and not funder:
+            raise SystemExit(
+                "live.signature_type=1 requires POLYMARKET_FUNDER "
+                "so orders, balances, and positions target the proxy wallet"
+            )
         kwargs = {"key": key, "chain_id": self.CHAIN_ID, "signature_type": sig_type}
         if funder:
             kwargs["funder"] = funder
         self.client = ClobClient(self.HOST, **kwargs)
-        self.client.set_api_creds(self.client.create_or_derive_api_creds())
+        self.client.set_api_creds(self.client.create_or_derive_api_key())
         self.tracker = tracker
         self.address = funder or self.client.get_address()
+        self._client_lock = threading.RLock()
         self.ws_fills_active = False
         self._open_orders: dict[str, list[RestingOrder]] = {}
         self._exit_orders: dict[str, RestingOrder] = {}
@@ -533,55 +548,89 @@ class LiveBroker:
     def _gtd_expiration(self) -> int:
         return int(time.time()) + self.order_ttl + GTD_SECURITY_THRESHOLD_SECS
 
+    def _erc20_balance(self, token_address: str, owner: str) -> float:
+        import httpx
+
+        if not self.rpc_url:
+            raise RuntimeError("live.rpc_url is required for on-chain balance refresh")
+        owner_arg = owner.lower().removeprefix("0x").rjust(64, "0")
+        data = "0x70a08231" + owner_arg
+        resp = httpx.post(
+            self.rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [{"to": token_address, "data": data}, "latest"],
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("error"):
+            raise RuntimeError(payload["error"])
+        return _parse_erc20_balance(payload.get("result"))
+
     def _place_buy(self, q: Quote) -> RestingOrder | None:
-        from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import OrderArgs, OrderType, Side
 
         try:
-            signed = self.client.create_order(OrderArgs(
-                price=q.price, size=q.size, side=BUY, token_id=q.token_id,
-                expiration=self._gtd_expiration(),
-            ))
-            resp = self.client.post_order(signed, OrderType.GTD)
+            with self._client_lock:
+                expiration = self._gtd_expiration()
+                signed = self.client.create_order(OrderArgs(
+                    price=q.price, size=q.size, side=Side.BUY, token_id=q.token_id,
+                    expiration=expiration,
+                ))
+                resp = self.client.post_order(signed, OrderType.GTD)
             oid = resp.get("orderID") or resp.get("orderId") or ""
             if oid:
-                return RestingOrder(oid, q, time.time(), self._gtd_expiration())
+                return RestingOrder(oid, q, time.time(), expiration)
         except Exception as e:  # noqa: BLE001
             log.error("order failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
         return None
 
     def _place_sell(self, q: Quote) -> RestingOrder | None:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import SELL
+        from py_clob_client_v2 import OrderArgs, OrderType, Side
 
         try:
-            signed = self.client.create_order(OrderArgs(
-                price=q.price, size=q.size, side=SELL, token_id=q.token_id,
-                expiration=self._gtd_expiration(),
-            ))
-            resp = self.client.post_order(signed, OrderType.GTD)
+            with self._client_lock:
+                expiration = self._gtd_expiration()
+                signed = self.client.create_order(OrderArgs(
+                    price=q.price, size=q.size, side=Side.SELL, token_id=q.token_id,
+                    expiration=expiration,
+                ))
+                resp = self.client.post_order(signed, OrderType.GTD)
             oid = resp.get("orderID") or resp.get("orderId") or ""
             if oid:
-                return RestingOrder(oid, q, time.time(), self._gtd_expiration())
+                return RestingOrder(oid, q, time.time(), expiration)
         except Exception as e:  # noqa: BLE001
             log.error("exit order failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
         return None
 
-    def _batch_cancel(self, order_ids: list[str]) -> None:
+    def _batch_cancel(self, order_ids: list[str]) -> bool:
         if not order_ids:
-            return
+            return True
         try:
-            self.client.cancel_orders(order_ids)
+            with self._client_lock:
+                self.client.cancel_orders(order_ids)
+            return True
         except Exception as e:  # noqa: BLE001
+            from py_clob_client_v2 import OrderPayload
+
+            ok = True
             for oid in order_ids:
                 try:
-                    self.client.cancel(oid)
+                    with self._client_lock:
+                        self.client.cancel_order(OrderPayload(orderID=oid))
                 except Exception:  # noqa: BLE001
+                    ok = False
                     log.warning("cancel failed %s: %s", oid[:16], e)
+            return ok
 
     def set_quotes(self, market: Market, quotes: list[Quote]) -> None:
-        from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import (
+            OrderArgs, OrderType, PartialCreateOrderOptions, PostOrdersV2Args, Side,
+        )
 
         self._markets[market.condition_id] = market
         desired = {q.token_id: q for q in quotes}
@@ -599,25 +648,33 @@ class LiveBroker:
             else:
                 to_cancel.append(ro.order_id)
 
-        self._batch_cancel(to_cancel)
+        if not self._batch_cancel(to_cancel):
+            log.warning("cancel failed in '%s' — reconciling before posting replacements",
+                        market.question[:45])
+            self.reconcile_orders()
+            return
 
         placed: list[RestingOrder] = []
         if desired:
             batch_args = []
             order_map: list[Quote] = []
+            options = PartialCreateOrderOptions(neg_risk=market.neg_risk)
             for q in desired.values():
                 try:
-                    signed = self.client.create_order(OrderArgs(
-                        price=q.price, size=q.size, side=BUY, token_id=q.token_id,
-                        expiration=self._gtd_expiration(),
-                    ))
-                    batch_args.append(PostOrdersArgs(order=signed, orderType=OrderType.GTD))
+                    expiration = self._gtd_expiration()
+                    with self._client_lock:
+                        signed = self.client.create_order(OrderArgs(
+                            price=q.price, size=q.size, side=Side.BUY, token_id=q.token_id,
+                            expiration=expiration,
+                        ), options)
+                    batch_args.append(PostOrdersV2Args(order=signed, orderType=OrderType.GTD))
                     order_map.append(q)
                 except Exception as e:  # noqa: BLE001
                     log.error("order build failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
             if batch_args:
                 try:
-                    resp = self.client.post_orders(batch_args)
+                    with self._client_lock:
+                        resp = self.client.post_orders(batch_args)
                     orders = resp if isinstance(resp, list) else resp.get("orders", [resp])
                     for i, item in enumerate(orders):
                         oid = ""
@@ -627,34 +684,53 @@ class LiveBroker:
                             placed.append(RestingOrder(
                                 oid, order_map[i], now, self._gtd_expiration()))
                 except Exception as e:  # noqa: BLE001
-                    log.error("batch post failed, falling back: %s", e)
-                    for q in desired.values():
-                        ro = self._place_buy(q)
-                        if ro:
-                            placed.append(ro)
+                    log.error("batch post failed; reconciling instead of retrying blindly: %s", e)
+                    self.reconcile_orders()
+                    return
+                if len(placed) < len(batch_args):
+                    # The post succeeded (no exception) but we parsed fewer order
+                    # IDs than orders sent — the unparsed orders may still be
+                    # resting on the exchange. Trusting empty local state here
+                    # would re-post them next cycle (duplicate stacking), so
+                    # rebuild from exchange truth instead.
+                    log.warning("batch post parsed %d/%d order IDs in '%s' — "
+                                "reconciling to avoid duplicate orders",
+                                len(placed), len(batch_args), market.question[:45])
+                    self.reconcile_orders()
+                    return
 
         self._open_orders[market.condition_id] = kept + placed
         if self.metrics:
             self.metrics.record_quotes(market.condition_id, quotes)
 
     def cancel_all(self) -> None:
+        ok = True
         try:
-            self.client.cancel_all()
+            with self._client_lock:
+                self.client.cancel_all()
         except Exception as e:  # noqa: BLE001
+            ok = False
             log.error("cancel_all failed: %s", e)
-        self._open_orders.clear()
-        self._exit_orders.clear()
+        if ok:
+            self._open_orders.clear()
+            self._exit_orders.clear()
+        else:
+            self.reconcile_orders()
 
     def cancel_quotes(self) -> None:
         ids = [ro.order_id for orders in self._open_orders.values() for ro in orders]
-        self._batch_cancel(ids)
-        self._open_orders.clear()
+        if self._batch_cancel(ids):
+            self._open_orders.clear()
+        else:
+            self.reconcile_orders()
 
     def cancel_quotes_for_market(self, market: Market) -> None:
         cid = market.condition_id
         ids = [ro.order_id for ro in self._open_orders.get(cid, [])]
-        self._batch_cancel(ids)
-        self._open_orders.pop(cid, None)
+        if self._batch_cancel(ids):
+            self._open_orders.pop(cid, None)
+        else:
+            self.reconcile_orders()
 
     def open_quotes(self, market: Market) -> list[Quote]:
         return [ro.quote for ro in self._open_orders.get(market.condition_id, [])]
@@ -667,8 +743,11 @@ class LiveBroker:
                 and cur.expiration - now >= GTD_REFRESH_MARGIN_SECS):
             return
         if cur is not None:
-            self._batch_cancel([cur.order_id])
-            self._exit_orders.pop(cid, None)
+            if self._batch_cancel([cur.order_id]):
+                self._exit_orders.pop(cid, None)
+            else:
+                self.reconcile_orders()
+                return
         if quote is None:
             return
         self._markets[cid] = market
@@ -683,15 +762,17 @@ class LiveBroker:
         return cur.quote if cur else None
 
     def taker_buy(self, market: Market, token_id: str, size: float, max_price: float) -> float:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import (
+            OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+        )
 
         size = round(size, 2)
         try:
-            signed = self.client.create_order(OrderArgs(
-                price=max_price, size=size, side=BUY, token_id=token_id,
-            ))
-            resp = self.client.post_order(signed, OrderType.FAK)
+            with self._client_lock:
+                signed = self.client.create_order(OrderArgs(
+                    price=max_price, size=size, side=Side.BUY, token_id=token_id,
+                ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
+                resp = self.client.post_order(signed, OrderType.FAK)
         except Exception as e:  # noqa: BLE001
             log.error("taker order failed %s @ %.3f: %s", token_id[:12], max_price, e)
             return 0.0
@@ -766,7 +847,8 @@ class LiveBroker:
     def reconcile_orders(self) -> None:
         """Rebuild local order state from exchange truth."""
         try:
-            remote = self.client.get_orders()
+            with self._client_lock:
+                remote = self.client.get_open_orders()
         except Exception as e:  # noqa: BLE001
             log.warning("order reconcile failed: %s", e)
             return
@@ -896,13 +978,28 @@ class LiveBroker:
             self._last_order_reconcile = poll_start
             self.reconcile_orders()
 
+        balances = []
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            bal = self.client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-            self._collateral = float(bal.get("balance") or 0) / 1e6
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+            with self._client_lock:
+                bal = self.client.get_balance_allowance(
+                    BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=int(self.cfg["live"]["signature_type"]),
+                    )
+                )
+            balances.append(float(bal.get("balance") or 0) / USDC_DECIMALS)
         except Exception as e:  # noqa: BLE001
-            log.warning("balance refresh failed: %s", e)
+            log.warning("CLOB balance refresh failed: %s", e)
+        try:
+            # Polymarket cash now lives as pUSD in the trading wallet/proxy.
+            # Keep the CLOB balance as a fallback, but don't add them together:
+            # future API versions may report the same pUSD balance directly.
+            balances.append(self._erc20_balance(PUSD, self.address))
+        except Exception as e:  # noqa: BLE001
+            log.warning("pUSD balance refresh failed: %s", e)
+        if balances:
+            self._collateral = max(balances)
 
     def _yes_mid(self, market: Market) -> float | None:
         book = self.tracker.books.get(market.yes_token)
@@ -984,4 +1081,21 @@ class LiveBroker:
             self.metrics.record_est_reward(usd)
 
     def check_crossed_books(self) -> None:
-        pass
+        """Detect resting orders that look crossed (should have filled) and
+        force an order reconcile on the next refresh_state. Runs on the event
+        loop, so it must not block — it only flags, never calls the network."""
+        for orders in self._open_orders.values():
+            for ro in orders:
+                book = self.tracker.books.get(ro.quote.token_id)
+                ask = book.best_ask if book else None
+                if ask is not None and ask <= ro.quote.price:
+                    log.warning("live bid appears crossed; forcing order reconcile")
+                    self._last_order_reconcile = 0.0
+                    return
+        for ro in self._exit_orders.values():
+            book = self.tracker.books.get(ro.quote.token_id)
+            bid = book.best_bid if book else None
+            if bid is not None and bid >= ro.quote.price:
+                log.warning("live exit ask appears crossed; forcing order reconcile")
+                self._last_order_reconcile = 0.0
+                return
