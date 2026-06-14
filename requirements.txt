@@ -1,0 +1,8 @@
+certifi
+httpx
+websockets
+pyyaml
+python-dotenv
+rich
+py-clob-client
+pytest
