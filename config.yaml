@@ -30,6 +30,16 @@ scanner:
   # Minimum reward-pool-to-book-liquidity ratio. Higher = less crowded
   # reward dollars. 0.01 means $1/day of rewards per $100 of book liquidity.
   min_pool_to_liquidity: 0.01
+  # Market-selection ranking (Option C). These only re-order markets that
+  # already pass the filters above (eligibility uses raw reward density), so
+  # they can never starve the scanner — set both to 0 for the old ranking.
+  #   toxicity_turnover_penalty: down-weight markets whose 24h volume is large
+  #     relative to resting liquidity (fast/informed flow that picks off makers).
+  #     score *= 1 / (1 + w * volume24h/liquidity).
+  #   band_room_bonus: prefer wider reward bands (more room to quote inside and
+  #     still merge pairs near $1.00). score *= 1 + w * (max_spread_cents - 1).
+  toxicity_turnover_penalty: 0.05
+  band_room_bonus: 0.10
   # Hard cap on market fee rate (basis points). Fees are charged per fill as
   # rate × min(p, 1-p) × shares — at 1000bps that's ~5c/share at mid 0.50,
   # several times any spread we can capture inside the reward band. Default 0:
@@ -69,6 +79,15 @@ scanner:
     - up or down
     - gold
     - xauusd
+    # Event / announcement-driven books: a single headline moves the mid faster
+    # than quotes can be pulled, so maker fills get picked off and the forced
+    # hedge pays up. These produced ~75% of live trading losses (see session
+    # review). Re-enable only with much larger capital and wider quotes.
+    - trump
+    - elon
+    - musk
+    - announce
+    - blockade
 
 quoting:
   # Where to place quotes inside the reward band, as a fraction of
@@ -225,3 +244,64 @@ metrics:
   db_path: data/live_metrics.db
   # Append-only JSONL of every fill — easy to grep, import into pandas, etc.
   trades_log: data/live_trades.jsonl
+
+# Self-managing controller: rewrites the knobs below in place from live equity
+# and the rolling markout (post-fill price drift = adverse selection). Two
+# layers:
+#   1. Capital tiers — structural caps that match wallet size. The active tier
+#      is the highest whose min_equity_usd <= current equity.
+#   2. Toxicity response — interpolates quoting/hedge knobs between the `calm`
+#      and `toxic` anchors based on how badly recent fills got picked off.
+# Every value the controller writes is bounded by the anchors here, so it can
+# only move within operator-defined limits. Changes apply on the next loop tick
+# (no restart needed). Set enabled: false to pin config to the static values.
+controller:
+  enabled: true
+  # How often to re-evaluate (first evaluation runs at startup).
+  interval_minutes: 10
+  # Fraction of the gap to a knob's target applied each evaluation (0..1).
+  # Lower = smoother/slower adaptation; 1.0 = jump straight to target.
+  smoothing: 0.5
+  # Rolling long-horizon markout (cents) anchors. At/above calm we use the
+  # `calm` knobs; at/below toxic we use the `toxic` knobs; linear in between.
+  markout_calm_cents: 0.0
+  markout_toxic_cents: -3.0
+  # Ignore the markout signal until at least this many fills are in the window.
+  min_markout_samples: 4
+  # Calm flow: quote tight, hedge fast, capture reward share.
+  calm:
+    offset_frac_of_max_spread: 0.30
+    flatten_after_secs: 120
+    flatten_max_spread_cents: 4.0
+    markout_trip_cents: -1.5
+    markout_min_samples: 5
+  # Toxic flow: quote wide, wait out passive exits, drop toxic markets fast.
+  toxic:
+    offset_frac_of_max_spread: 0.60
+    flatten_after_secs: 360
+    flatten_max_spread_cents: 2.0
+    markout_trip_cents: -0.8
+    markout_min_samples: 2
+  # Capital tiers (ascending). Bigger wallet -> more markets and larger caps;
+  # a drawdown drops to a lower tier automatically and tightens everything.
+  capital_tiers:
+    - min_equity_usd: 0
+      top_n_markets: 1
+      max_inventory_usd_per_market: 25
+      daily_loss_limit_usd: 8
+      hard_kill_loss_usd: 20
+    - min_equity_usd: 250
+      top_n_markets: 2
+      max_inventory_usd_per_market: 50
+      daily_loss_limit_usd: 20
+      hard_kill_loss_usd: 50
+    - min_equity_usd: 750
+      top_n_markets: 3
+      max_inventory_usd_per_market: 90
+      daily_loss_limit_usd: 50
+      hard_kill_loss_usd: 120
+    - min_equity_usd: 2000
+      top_n_markets: 4
+      max_inventory_usd_per_market: 200
+      daily_loss_limit_usd: 120
+      hard_kill_loss_usd: 300

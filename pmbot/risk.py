@@ -148,6 +148,15 @@ class MarketGuards:
     def __init__(self, cfg: dict):
         self.on_trip: Callable[[str], None] | None = None
         self.on_side_block: Callable[[str], None] | None = None
+        self._load(cfg)
+        self._mids: dict[str, list[tuple[float, float]]] = {}
+        self._paused_until: dict[str, float] = {}
+        self._trade_times: dict[str, deque] = {}
+        self._taker_sides: dict[str, deque] = {}
+        self._side_blocked_until: dict[str, float] = {}
+        self._flow: dict[str, deque] = {}
+
+    def _load(self, cfg: dict) -> None:
         g = cfg["guards"]
         self.vol_window = float(g["vol_window_secs"])
         self.vol_move = float(g["vol_max_move_cents"]) / 100.0
@@ -163,12 +172,14 @@ class MarketGuards:
         self.flow_widen_thr = float(g["flow_widen_threshold"])
         self.flow_pull_thr = float(g["flow_pull_threshold"])
         self.flow_widen_max = float(g["flow_widen_max_cents"]) / 100.0
-        self._mids: dict[str, list[tuple[float, float]]] = {}
-        self._paused_until: dict[str, float] = {}
-        self._trade_times: dict[str, deque] = {}
-        self._taker_sides: dict[str, deque] = {}
-        self._side_blocked_until: dict[str, float] = {}
-        self._flow: dict[str, deque] = {}
+
+    def reload(self, cfg: dict) -> None:
+        """Re-read guard thresholds after the controller mutates config.
+
+        Only refreshes scalar thresholds; in-flight per-market state
+        (cooldowns, flow deques, taker-side history) is preserved.
+        """
+        self._load(cfg)
 
     def allow(self, cid: str, now: float) -> bool:
         return now >= self._paused_until.get(cid, 0.0)
@@ -309,6 +320,17 @@ class MarkoutTracker:
         self._samples: dict[str, list[tuple[float, float, float]]] = {}
         self._session: dict[float, list[float]] = {h: [] for h in self.horizons}
 
+    def reload(self, cfg: dict) -> None:
+        """Re-read markout thresholds after the controller mutates config.
+
+        Horizons are intentionally left fixed — pending samples are keyed by
+        horizon, so changing them mid-session would orphan in-flight markouts.
+        """
+        g = cfg["guards"]
+        self.window = float(g["markout_window_minutes"]) * 60
+        self.min_samples = int(g["markout_min_samples"])
+        self.trip_cents = float(g["markout_trip_cents"])
+
     def ingest(self, fills: list[dict]) -> None:
         newest = self._seen_ts
         for f in fills:
@@ -364,6 +386,20 @@ class MarkoutTracker:
         if not vals:
             return None
         return sum(vals) / len(vals)
+
+    def recent_markout(self, horizon: float | None = None) -> tuple[float, int]:
+        """Rolling cross-market markout (cents) and sample count.
+
+        Aggregates every market's windowed samples at the long horizon — the
+        adaptive controller's primary read on how toxic current flow is.
+        Returns (0.0, 0) when no samples are available.
+        """
+        h = horizon if horizon is not None else (max(self.horizons) if self.horizons else 0.0)
+        vals = [m for samples in self._samples.values()
+                for _, hh, m in samples if hh == h]
+        if not vals:
+            return 0.0, 0
+        return sum(vals) / len(vals) * 100, len(vals)
 
     def toxic_markets(self) -> list[tuple[str, float, int]]:
         h_long = max(self.horizons)

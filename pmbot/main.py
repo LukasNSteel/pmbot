@@ -26,6 +26,7 @@ from rich.table import Table
 from . import gamma, strategy
 from .books import BookTracker
 from .brokers import LiveBroker, PaperBroker
+from .controller import AdaptiveController
 from .metrics import MetricsStore
 from .risk import MarketGuards, MarkoutTracker, RiskAction, RiskManager
 
@@ -208,6 +209,8 @@ class Bot:
         self.guards = MarketGuards(cfg)
         self.markouts = MarkoutTracker(cfg)
         self.metrics = _metrics_store(cfg)
+        self.controller = AdaptiveController(cfg, self.guards, self.markouts,
+                                             self.metrics)
         self._token_market: dict[str, gamma.Market] = {}
         self._size_factors: dict[str, float] = {}
         self._last_scan = 0.0
@@ -261,6 +264,7 @@ class Bot:
                         self.metrics.fetch_realized_rewards, self.broker.client)
 
                 equity = self.broker.equity()
+                self.controller.maybe_apply(now, equity)
                 self._scale = self.risk.scale(equity)
                 action = self.risk.check(equity, self.broker.total_inventory_usd(),
                                          self._scale)
@@ -730,6 +734,8 @@ class Bot:
         uptime = self.metrics.session_uptime_pct()
         if uptime > 0:
             console.print(f"in-band uptime: {uptime:.1f}%")
+        if self.controller.enabled:
+            console.print(self.controller.status_line())
         eq = self.broker.equity()
         if eq != eq:
             return
