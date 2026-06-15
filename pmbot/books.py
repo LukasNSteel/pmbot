@@ -86,6 +86,15 @@ class BookTracker:
     def on_trade(self, callback) -> None:
         self._trade_listeners.append(callback)
 
+    def feed_age(self, now: float | None = None) -> float:
+        """Seconds since any websocket traffic (book/trade/PONG heartbeat).
+
+        Liveness of the feed itself, independent of whether any single book has
+        ticked. A fresh feed_age with a quiet book means the market is simply
+        idle (safe to quote); a large feed_age means the socket is lagging or
+        dead (our view may be diverging — pull quotes)."""
+        return (now if now is not None else time.time()) - self.last_msg_ts
+
     async def start(self) -> None:
         await self._rest_refresh_all()  # prime books before quoting
         self._tasks = [

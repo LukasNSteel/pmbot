@@ -7,11 +7,43 @@ from pmbot.gamma import Market
 from pmbot.strategy import (
     Quote,
     adaptive_offset,
+    book_feed_stale,
     book_is_quotable,
     compute_quotes,
     microprice,
     reconcile_quotes,
 )
+
+
+def test_quiet_book_with_live_feed_is_not_stale():
+    # Feed alive (heartbeat 5s ago), but this book hasn't ticked in 40s — a
+    # quiet market. We must NOT pull quotes: idle books are safe farming time.
+    assert book_feed_stale(feed_age=5.0, book_age=40.0, max_stale=25.0) is False
+
+
+def test_dead_feed_is_stale():
+    # No websocket traffic at all for 30s > max_stale — socket lagging/dead.
+    assert book_feed_stale(feed_age=30.0, book_age=30.0, max_stale=25.0) is True
+
+
+def test_silently_dropped_token_backstop():
+    # Feed alive but one book hasn't updated in >4x max_stale (and >120s):
+    # backstop catches a silently dropped single-token subscription.
+    assert book_feed_stale(feed_age=2.0, book_age=130.0, max_stale=25.0) is True
+    # Just under the 120s floor with a live feed -> still safe.
+    assert book_feed_stale(feed_age=2.0, book_age=110.0, max_stale=25.0) is False
+
+
+def test_feed_age_floor_uses_120s_when_max_stale_small():
+    # 4 * 10 = 40, but the floor is 120s, so a 90s-quiet book stays quotable.
+    assert book_feed_stale(feed_age=3.0, book_age=90.0, max_stale=10.0) is False
+
+
+def test_book_tracker_feed_age():
+    from pmbot.books import BookTracker
+    bt = BookTracker([])
+    bt.last_msg_ts = 1000.0
+    assert bt.feed_age(now=1007.0) == 7.0
 
 
 def _market(**kw) -> Market:

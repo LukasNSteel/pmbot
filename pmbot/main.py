@@ -513,12 +513,14 @@ class Bot:
             no_book = self.tracker.books[m.no_token]
             if yes_book.mid is not None:
                 self.guards.record_mid(m.condition_id, yes_book.mid, now, m.question)
-            oldest_book_update = min(yes_book.updated_ts, no_book.updated_ts)
-            if now - oldest_book_update > max_stale:
+            feed_age = self.tracker.feed_age(now)
+            book_age = now - min(yes_book.updated_ts, no_book.updated_ts)
+            if strategy.book_feed_stale(feed_age, book_age, max_stale):
                 self.metrics.sample_uptime(m.condition_id, False)
                 if self.broker.open_quotes(m):
-                    log.warning("book stale %.0fs — pulling quotes from '%s'",
-                                now - oldest_book_update, m.question[:45])
+                    log.warning("feed/book stale (feed %.0fs, book %.0fs) — "
+                                "pulling quotes from '%s'",
+                                feed_age, book_age, m.question[:45])
                     updates.append((m, []))
                 continue
             band = m.max_spread_cents / 100.0

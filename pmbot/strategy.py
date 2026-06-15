@@ -36,6 +36,19 @@ def _round_tick(price: float, tick: float) -> float:
     return round(steps * tick, 6)
 
 
+def book_feed_stale(feed_age: float, book_age: float, max_stale: float) -> bool:
+    """True when our book view may diverge from reality and quotes must be pulled.
+
+    Feed-level staleness (no websocket traffic for `max_stale`s, heartbeat
+    included) means the socket is lagging or dead — the real danger. A book
+    that is merely quiet while the feed is alive is safe to keep quoting; idle
+    books are prime reward-farming time, not a hazard. A long per-book ceiling
+    (4× max_stale, floored at 120s) backstops a silently dropped single-token
+    subscription that the feed heartbeat alone would miss (REST resync also
+    covers this case)."""
+    return feed_age > max_stale or book_age > max(max_stale * 4.0, 120.0)
+
+
 def book_is_quotable(yes_book: Book, band: float, max_spread_mult: float) -> bool:
     """Require a two-sided book with a sane spread — never quote off last-trade."""
     bb, ba = yes_book.best_bid, yes_book.best_ask
