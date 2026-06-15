@@ -276,3 +276,60 @@ def test_live_crossed_book_forces_reconcile_without_blocking():
 
     stub.reconcile_orders.assert_not_called()
     assert stub._last_order_reconcile == 0.0
+
+
+# --- deposit-wallet (signature_type 3) balance-cache sync regression -------
+# Without these, the CLOB's cache reads 0 for the deposit wallet and rejects
+# orders with "not enough balance / allowance: ... balance: 0".
+
+def _live_stub(sig_type=3):
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.cfg = {"live": {"signature_type": sig_type}}
+    stub._gtd_expiration = lambda: 123
+    stub.metrics = None
+    stub.sync_calls = []
+    stub._sync_clob_balance = lambda at, tid=None: stub.sync_calls.append((at, tid))
+    return stub
+
+
+def test_place_sell_syncs_conditional_balance_first():
+    from py_clob_client_v2 import AssetType
+    stub = _live_stub()
+    stub.client.post_order.return_value = {"orderID": "oidS"}
+    ro = LiveBroker._place_sell(stub, Quote("tok9", 0.62, 50))
+    assert ro is not None and ro.order_id == "oidS"
+    # the conditional token was synced for exactly the token being sold
+    assert stub.sync_calls == [(AssetType.CONDITIONAL, "tok9")]
+
+
+def test_taker_buy_syncs_collateral_first():
+    from py_clob_client_v2 import AssetType
+    stub = _live_stub()
+    stub.client.post_order.return_value = {"takingAmount": "10.0"}
+    filled = LiveBroker.taker_buy(stub, _market(), "tok9", 10.0, 0.6)
+    assert filled == 10.0
+    assert (AssetType.COLLATERAL, None) in stub.sync_calls
+
+
+def test_sync_clob_balance_builds_params_and_swallows_errors():
+    from py_clob_client_v2 import AssetType
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.cfg = {"live": {"signature_type": 3}}
+    stub.client.update_balance_allowance.side_effect = RuntimeError("relayer down")
+    # a sync hiccup must never bubble up into the quoting loop
+    LiveBroker._sync_clob_balance(stub, AssetType.CONDITIONAL, "tok9")
+    params = stub.client.update_balance_allowance.call_args.args[0]
+    assert params.token_id == "tok9"
+    assert params.signature_type == 3
+
+
+def test_select_collateral_prefers_onchain_over_stale_cache():
+    # on-chain pUSD wins even when the (stale) CLOB cache reads higher
+    assert LiveBroker._select_collateral(70.5, 100.0) == 70.5
+    # falls back to the cache only when the on-chain read is unavailable
+    assert LiveBroker._select_collateral(None, 100.0) == 100.0
+    assert LiveBroker._select_collateral(None, None) is None

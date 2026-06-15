@@ -126,8 +126,13 @@ Estimated rewards are not banked cash until they appear as realized rewards.
 1. Copy `.env.example` to `.env` and fill in:
    - `POLYMARKET_PRIVATE_KEY` — email/Magic logins: Settings → Export Private Key
    - `POLYMARKET_FUNDER` — your Polymarket deposit address (profile page)
+   - `POLYMARKET_BUILDER_API_KEY` / `_SECRET` / `_PASSPHRASE` — only for
+     `signature_type 3` deposit wallets that want gasless on-chain merging
+     (the Builder API key from the Builders page; not the standalone Relayer
+     API key); leave blank to skip merging
 2. Set `live.signature_type` in `config.yaml`: `1` for email/Magic login,
-   `2` for browser-wallet login, `0` for a plain EOA trading directly
+   `2` for browser-wallet login, `3` for a new-API deposit wallet (POLY_1271),
+   `0` for a plain EOA trading directly
 3. Fund the account from Polymarket. Current Polymarket cash is held as pUSD
    in the trading wallet/proxy shown on your profile.
 4. Set `mode: live` in `config.yaml` and run `python -m pmbot.main run`
@@ -140,7 +145,9 @@ In live mode:
 - Positions polled every ~12s with WS-fill delta reconciliation
 - Equity includes pUSD cash from `POLYMARKET_FUNDER` plus marked-to-market
   YES/NO positions. This is what drives equity-scaled sizing and loss limits.
-- YES+NO pairs merged on-chain every ~60s (once `merge_min_pairs` accumulate)
+- YES+NO pairs merged on-chain every ~60s (once `merge_min_pairs` accumulate),
+  recycling locked capital. Deposit wallets (type 3) merge gaslessly via the
+  Polymarket relayer; EOA/proxy (types 0/1) self-submit and pay a little POL
 
 Start with a small `capital_usd` and watch the first sessions closely.
 

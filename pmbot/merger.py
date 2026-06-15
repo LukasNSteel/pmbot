@@ -3,25 +3,34 @@
 The CLOB has no merge endpoint — pairs are merged through Polymarket's pUSD
 collateral adapters on Polygon (post the 2026-04 pUSD migration). The adapter
 pulls equal YES+NO tokens from the wallet (one-time CTF setApprovalForAll),
-merges them via the core CTF contract, and returns $1 pUSD per pair:
+merges them via the core CTF contract, receives the released USDC.e, wraps it
+into pUSD, and returns $1 pUSD per pair. Both market types use the SAME
+pUSD-native 5-arg signature — only the adapter address differs:
 
     standard markets:  CtfCollateralAdapter.mergePositions(
                            pUSD, 0x0, conditionId, [1, 2], amount)
     neg-risk markets:  NegRiskCtfCollateralAdapter.mergePositions(
-                           conditionId, amount)
+                           pUSD, 0x0, conditionId, [1, 2], amount)
 
 Who executes depends on the account type:
-    signature_type 0 — the EOA holds the tokens; call the adapter directly.
+    signature_type 0 — the EOA holds the tokens; call the adapter directly,
+        paying POL gas from the EOA.
     signature_type 1 — tokens live in a Polymarket proxy wallet; the owner
         EOA routes calls through ProxyWalletFactory.proxy(...), which executes
-        them as the proxy wallet (approval + merge batch in one transaction).
+        them as the proxy wallet (approval + merge batch in one transaction),
+        paying POL gas from the EOA.
+    signature_type 3 — tokens live in a POLY_1271 deposit wallet (an ERC-1967
+        proxy whose execute() is onlyFactory, so it cannot be self-submitted).
+        The owner signs a DepositWallet `Batch` (EIP-712) and POSTs it to
+        Polymarket's relayer, whose operator forwards it via the factory. This
+        path is GASLESS (the relayer pays) but needs builder API-key creds
+        (Polymarket Settings -> API Keys). Without creds, merging stays
+        disabled and pairs redeem at resolution.
     signature_type 2 — Gnosis Safe accounts are not supported here (needs a
-        signed Safe transaction or Polymarket's relayer with builder
-        credentials); pairs simply redeem at resolution instead.
+        signed Safe transaction); pairs simply redeem at resolution instead.
 
-Gas is paid in POL by the signing EOA. After repeated failures merging is
-disabled for the session — the bot runs fine without it, pairs are riskless
-($1 at resolution), just capital-locked.
+After repeated failures merging is disabled for the session — the bot runs
+fine without it, pairs are riskless ($1 at resolution), just capital-locked.
 """
 
 from __future__ import annotations
@@ -53,6 +62,10 @@ RECEIPT_POLL_SECS = 3.0
 RECEIPT_TIMEOUT_SECS = 120.0
 MAX_FAILURES = 3
 
+# Deposit-wallet (signature_type 3) gasless merging via Polymarket's relayer.
+DEFAULT_RELAYER_URL = "https://relayer-v2.polymarket.com"
+RELAYER_BATCH_DEADLINE_SECS = 600
+
 
 def _calldata(signature: str, types: list[str], args: list) -> bytes:
     return keccak(text=signature)[:4] + abi_encode(types, args)
@@ -62,19 +75,39 @@ class Merger:
     """Builds, signs, and submits merge transactions over plain JSON-RPC."""
 
     def __init__(self, rpc_url: str, signature_type: int, private_key: str,
-                 funder: str | None):
+                 funder: str | None, relayer_url: str | None = None,
+                 builder_creds: dict | None = None):
         self.rpc_url = rpc_url
         self.sig_type = signature_type
+        self._private_key = private_key
         self.account = Account.from_key(private_key)
-        # The wallet that actually holds tokens/pUSD (proxy wallet for type 1).
+        # The wallet that actually holds tokens/pUSD (proxy / deposit wallet).
         self.wallet = to_checksum_address(funder) if funder else self.account.address
         self.disabled: str | None = None
         self._approved: set[str] = set()
         self._failures = 0
         self._http = httpx.Client(timeout=20.0, verify=certifi.where())
-        if self.sig_type not in (0, 1):
-            self.disabled = ("signature_type 2 (Gnosis Safe) — on-chain merge "
-                             "unsupported; pairs redeem at resolution instead")
+        self._relayer = None  # set for signature_type 3 when creds are present
+        if self.sig_type in (0, 1):
+            pass  # self-submitted JSON-RPC path (gas paid by the EOA)
+        elif self.sig_type == 3:
+            if not builder_creds:
+                self.disabled = (
+                    "POLY_1271 deposit wallet — set relayer builder API creds "
+                    "(POLYMARKET_BUILDER_API_KEY / _SECRET / _PASSPHRASE) to enable "
+                    "gasless on-chain merging; until then pairs redeem at resolution")
+                log.info("merging disabled: %s", self.disabled)
+            else:
+                try:
+                    self._init_relayer(relayer_url or DEFAULT_RELAYER_URL, builder_creds)
+                    log.info("deposit-wallet merging enabled via relayer (wallet %s)",
+                             self.wallet)
+                except Exception as e:  # noqa: BLE001
+                    self.disabled = f"deposit-wallet relayer init failed: {e}"
+                    log.warning("merging disabled: %s", self.disabled)
+        else:
+            self.disabled = ("Gnosis Safe — on-chain merge unsupported here; "
+                             "pairs redeem at resolution instead")
             log.info("merging disabled: %s", self.disabled)
 
     # ------------------------------------------------------------ JSON-RPC
@@ -138,6 +171,8 @@ class Merger:
                                 ["address", "bool"], [adapter, True]))]
 
     def _execute(self, calls: list[tuple[str, bytes]]) -> bool:
+        if self.sig_type == 3:
+            return self._execute_via_relayer(calls)
         if self.sig_type == 1:
             # Route through the proxy factory so the calls execute as the
             # proxy wallet; the whole batch lands in one transaction.
@@ -148,6 +183,57 @@ class Merger:
         for to, data in calls:  # EOA: sequential transactions
             if not self._send_tx(to, data):
                 return False
+        return True
+
+    # ----------------------------------------------------- deposit wallet (3)
+
+    def _init_relayer(self, relayer_url: str, builder_creds: dict) -> None:
+        """Build the Polymarket relayer client for the deposit-wallet flow.
+
+        Raises if creds are malformed or the relayer-derived deposit wallet
+        disagrees with the configured funder (clear misconfiguration)."""
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
+
+        config = BuilderConfig(local_builder_creds=BuilderApiKeyCreds(
+            key=builder_creds["key"], secret=builder_creds["secret"],
+            passphrase=builder_creds["passphrase"]))
+        self._relayer = RelayClient(relayer_url, CHAIN_ID, self._private_key,
+                                    config, rpc_url=self.rpc_url)
+        # Sanity: the deterministic deposit wallet must match the funder. A
+        # mismatch means orders and merges would target different wallets.
+        try:
+            derived = to_checksum_address(self._relayer.get_expected_deposit_wallet())
+        except Exception as e:  # noqa: BLE001 — network/derivation hiccup, non-fatal
+            log.debug("could not derive deposit wallet for sanity check: %s", e)
+            return
+        if derived != self.wallet:
+            raise RuntimeError(
+                f"relayer-derived deposit wallet {derived} != funder {self.wallet}")
+
+    def _execute_via_relayer(self, calls: list[tuple[str, bytes]]) -> bool:
+        """Submit the approval+merge calls as one signed DepositWallet Batch to
+        the relayer and block until it confirms on-chain. Gasless."""
+        from py_builder_relayer_client.models import DepositWalletCall, TransactionType
+
+        dw_calls = [
+            DepositWalletCall(target=to_checksum_address(to), value="0",
+                              data="0x" + data.hex())
+            for to, data in calls
+        ]
+        nonce_payload = self._relayer.get_nonce(self.account.address,
+                                                TransactionType.WALLET.value)
+        nonce = nonce_payload.get("nonce") if nonce_payload else None
+        if nonce is None:
+            raise RuntimeError("relayer returned no WALLET nonce")
+        deadline = str(int(time.time()) + RELAYER_BATCH_DEADLINE_SECS)
+        resp = self._relayer.execute_deposit_wallet_batch(
+            dw_calls, self.wallet, str(nonce), deadline)
+        log.info("relayer batch submitted (txID=%s); awaiting confirmation…",
+                 resp.transaction_id)
+        confirmed = resp.wait()
+        if confirmed is None:
+            raise RuntimeError("relayer batch did not confirm (failed or timed out)")
         return True
 
     def merge(self, condition_id: str, neg_risk: bool, pairs: float) -> bool:
@@ -161,15 +247,17 @@ class Merger:
         amount = int(pairs) * USDC_DECIMALS
         if amount <= 0:
             return False
+        # Both the standard and neg-risk collateral adapters expose the same
+        # pUSD-native CTF signature; only the target contract differs. Each
+        # adapter merges via the core CTF, takes the released USDC.e, and wraps
+        # it back into pUSD for the wallet. (The neg-risk adapter does NOT use a
+        # 2-arg mergePositions(conditionId, amount) — that selector exists but is
+        # the core NegRiskAdapter's USDC.e path and reverts here.)
         adapter = NEG_RISK_CTF_ADAPTER if neg_risk else CTF_ADAPTER
-        if neg_risk:
-            merge_call = _calldata("mergePositions(bytes32,uint256)",
-                                   ["bytes32", "uint256"], [cid, amount])
-        else:
-            merge_call = _calldata(
-                "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
-                ["address", "bytes32", "bytes32", "uint256[]", "uint256"],
-                [PUSD, b"\x00" * 32, cid, [1, 2], amount])
+        merge_call = _calldata(
+            "mergePositions(address,bytes32,bytes32,uint256[],uint256)",
+            ["address", "bytes32", "bytes32", "uint256[]", "uint256"],
+            [PUSD, b"\x00" * 32, cid, [1, 2], amount])
         try:
             calls = self._ensure_approval(adapter) + [(adapter, merge_call)]
             ok = self._execute(calls)

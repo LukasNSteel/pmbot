@@ -5,4 +5,7 @@ pyyaml
 python-dotenv
 rich
 py-clob-client-v2
+# Deposit-wallet (signature_type 3) gasless merging via the Polymarket relayer.
+py-builder-relayer-client
+py-builder-signing-sdk
 pytest

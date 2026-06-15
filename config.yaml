@@ -81,8 +81,13 @@ quoting:
   requote_move_cents: 0.4
   # Quote size as a multiple of the market's min_incentive_size.
   size_mult_of_min: 1.0
-  # Hard cap on capital committed to any single market (USD).
-  max_capital_per_market: 90
+  # Hard cap on capital committed to any single market (USD). Two constraints:
+  #   - the scanner drops any market whose min quote size (shares) exceeds this,
+  #     so it must be >= the min_incentive_size of markets you want (~50 shares),
+  #   - keep max_capital_per_market × top_n_markets <= capital_usd so busy
+  #     markets can't oversubscribe the wallet.
+  # At $100 capital with 50-share markets, 50 is the sweet spot (50 × 2 = 100).
+  max_capital_per_market: 50
   # How aggressively to skew quotes against accumulated inventory (0..1).
   skew_strength: 0.6
   # GTD order lifetime (seconds). Orders self-expire on crash; requote loop refreshes.
@@ -191,17 +196,30 @@ risk:
   exit_hours_before_end: 2
 
 live:
-  # 0 = plain EOA wallet, 1 = email/Magic login, 2 = browser-wallet login.
-  signature_type: 1
+  # 0 = plain EOA wallet, 1 = email/Magic proxy, 2 = browser-wallet (Gnosis
+  # Safe), 3 = POLY_1271 deposit wallet (new in CLOB V2). Types 1/2/3 hold
+  # funds in a separate wallet and require POLYMARKET_FUNDER. The V2 backend
+  # rejects the maker address with "please use the deposit wallet flow" unless
+  # this matches how the funder wallet was actually deployed — confirmed type 3
+  # for this account via scripts/sigtype_probe.py.
+  signature_type: 3
   # On-chain merging of YES+NO pairs back to $1 pUSD (recycles locked capital).
-  # The signing wallet needs a little POL for gas (~fractions of a cent per
-  # merge). Supported for signature types 0 and 1; type 2 (Gnosis Safe)
-  # auto-disables and pairs simply redeem at resolution.
+  #   types 0/1 (EOA, proxy): self-submitted tx; the signing wallet needs a
+  #     little POL for gas (~fractions of a cent per merge).
+  #   type 3 (deposit wallet): GASLESS via the Polymarket relayer — requires
+  #     builder API-key creds in .env (POLYMARKET_BUILDER_API_KEY/_SECRET/
+  #     _PASSPHRASE, from the Builders page on polymarket.com). Without them,
+  #     type-3 merging auto-disables and pairs redeem at resolution.
+  #   type 2 (Gnosis Safe): auto-disables; pairs redeem at resolution.
   merge_enabled: true
   # Only merge once at least this many pairs have accumulated in a market.
-  merge_min_pairs: 20
+  # Lower recycles capital sooner (each merge is a gasless relayer round trip);
+  # 10 suits a small ~$100 book.
+  merge_min_pairs: 10
   # Any public Polygon RPC endpoint works (must support eth_call/eth_sendRawTransaction).
   rpc_url: https://polygon-bor-rpc.publicnode.com
+  # Polymarket relayer used for gasless deposit-wallet (type 3) merges.
+  relayer_url: https://relayer-v2.polymarket.com
 
 metrics:
   db_path: data/live_metrics.db

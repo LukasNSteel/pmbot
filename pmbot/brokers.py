@@ -508,10 +508,11 @@ class LiveBroker:
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
         self.rpc_url = cfg["live"].get("rpc_url")
         sig_type = int(cfg["live"]["signature_type"])
-        if sig_type == 1 and not funder:
+        if sig_type in (1, 2, 3) and not funder:
             raise SystemExit(
-                "live.signature_type=1 requires POLYMARKET_FUNDER "
-                "so orders, balances, and positions target the proxy wallet"
+                f"live.signature_type={sig_type} requires POLYMARKET_FUNDER "
+                "so orders, balances, and positions target the funding wallet "
+                "(proxy / Safe / deposit wallet)"
             )
         kwargs = {"key": key, "chain_id": self.CHAIN_ID, "signature_type": sig_type}
         if funder:
@@ -540,7 +541,20 @@ class LiveBroker:
         if cfg["live"].get("merge_enabled", False):
             try:
                 from .merger import Merger
-                self.merger = Merger(cfg["live"]["rpc_url"], sig_type, key, funder)
+                # Deposit wallets (signature_type 3) merge gaslessly via the
+                # Polymarket relayer, which authenticates with *builder* API-key
+                # creds (Builders page -> API keys: apiKey/secret/passphrase).
+                # Absent, type-3 merging stays off.
+                builder_creds = None
+                bk = os.environ.get("POLYMARKET_BUILDER_API_KEY")
+                bs = os.environ.get("POLYMARKET_BUILDER_SECRET")
+                bp = os.environ.get("POLYMARKET_BUILDER_PASSPHRASE")
+                if bk and bs and bp:
+                    builder_creds = {"key": bk, "secret": bs, "passphrase": bp}
+                self.merger = Merger(
+                    cfg["live"]["rpc_url"], sig_type, key, funder,
+                    relayer_url=cfg["live"].get("relayer_url"),
+                    builder_creds=builder_creds)
             except Exception as e:  # noqa: BLE001
                 log.warning("on-chain merger unavailable: %s", e)
         log.info("live client ready (signature_type=%d, address=%s)", sig_type, self.address)
@@ -571,6 +585,37 @@ class LiveBroker:
             raise RuntimeError(payload["error"])
         return _parse_erc20_balance(payload.get("result"))
 
+    def _sync_clob_balance(self, asset_type, token_id: str | None = None) -> None:
+        """Push on-chain balances into the CLOB's server-side cache.
+
+        REQUIRED for deposit wallets (signature_type 3): unlike EOA/proxy
+        wallets, the CLOB does not auto-track a deposit wallet's chain balances,
+        so until this is called the cache reads 0 and orders are rejected with
+        "not enough balance / allowance: ... balance: 0". Call it for COLLATERAL
+        before spending pUSD and for the CONDITIONAL token before selling it.
+        Best-effort: a sync hiccup shouldn't crash the quoting loop."""
+        try:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams  # noqa: F401
+            params = BalanceAllowanceParams(
+                asset_type=asset_type,
+                token_id=token_id or "",
+                signature_type=int(self.cfg["live"]["signature_type"]),
+            )
+            with self._client_lock:
+                self.client.update_balance_allowance(params)
+        except Exception as e:  # noqa: BLE001
+            log.debug("CLOB balance sync failed (%s %s): %s",
+                      asset_type, (token_id or "")[:12], e)
+
+    @staticmethod
+    def _select_collateral(onchain: float | None, clob_cache: float | None) -> float | None:
+        """On-chain pUSD is the source of truth for collateral; the CLOB cache
+        is only a fallback. For deposit wallets the cache can be stale/zero, so
+        never take max() of the two (a stale-high cache would inflate equity)."""
+        if onchain is not None:
+            return onchain
+        return clob_cache
+
     def _place_buy(self, q: Quote) -> RestingOrder | None:
         from py_clob_client_v2 import OrderArgs, OrderType, Side
 
@@ -590,8 +635,11 @@ class LiveBroker:
         return None
 
     def _place_sell(self, q: Quote) -> RestingOrder | None:
-        from py_clob_client_v2 import OrderArgs, OrderType, Side
+        from py_clob_client_v2 import AssetType, OrderArgs, OrderType, Side
 
+        # Selling spends the conditional token; the CLOB must have a fresh view
+        # of the deposit wallet's holding of it or it rejects with "balance: 0".
+        self._sync_clob_balance(AssetType.CONDITIONAL, q.token_id)
         try:
             with self._client_lock:
                 expiration = self._gtd_expiration()
@@ -763,14 +811,26 @@ class LiveBroker:
 
     def taker_buy(self, market: Market, token_id: str, size: float, max_price: float) -> float:
         from py_clob_client_v2 import (
-            OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+            AssetType, MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side,
         )
 
         size = round(size, 2)
+        # Hedge buys spend pUSD collateral; refresh the CLOB's deposit-wallet view.
+        self._sync_clob_balance(AssetType.COLLATERAL)
+        # A marketable FAK buy is validated by the backend as a *market* buy, whose
+        # maker (collateral) amount must round to <=2 decimals. create_order(price,
+        # size) sends maker = price*size, which carries up to 4 decimals and is
+        # rejected ("invalid amounts ... maker amount supports a max accuracy of 2
+        # decimals"). The market-order builder takes the spend amount directly and
+        # rounds it correctly, so quote in collateral terms instead.
+        amount = round(size * max_price, 2)
+        if amount <= 0:
+            return 0.0
         try:
             with self._client_lock:
-                signed = self.client.create_order(OrderArgs(
-                    price=max_price, size=size, side=Side.BUY, token_id=token_id,
+                signed = self.client.create_market_order(MarketOrderArgs(
+                    token_id=token_id, amount=amount, side=Side.BUY,
+                    price=max_price, order_type=OrderType.FAK,
                 ), PartialCreateOrderOptions(neg_risk=market.neg_risk))
                 resp = self.client.post_order(signed, OrderType.FAK)
         except Exception as e:  # noqa: BLE001
@@ -978,9 +1038,20 @@ class LiveBroker:
             self._last_order_reconcile = poll_start
             self.reconcile_orders()
 
-        balances = []
+        # On-chain pUSD held by the wallet is the source of truth for collateral
+        # (and thus equity, sizing, and loss limits). The CLOB's balance cache is
+        # only used as a fallback: for deposit wallets it can be stale/zero unless
+        # we push it an update, and taking max() of a stale-high cache and the
+        # real balance inflates equity. We still push the cache an update so the
+        # CLOB admits our BUY orders.
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+        self._sync_clob_balance(AssetType.COLLATERAL)
+        onchain = clob_cache = None
         try:
-            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+            onchain = self._erc20_balance(PUSD, self.address)
+        except Exception as e:  # noqa: BLE001
+            log.warning("pUSD balance refresh failed: %s", e)
+        try:
             with self._client_lock:
                 bal = self.client.get_balance_allowance(
                     BalanceAllowanceParams(
@@ -988,18 +1059,12 @@ class LiveBroker:
                         signature_type=int(self.cfg["live"]["signature_type"]),
                     )
                 )
-            balances.append(float(bal.get("balance") or 0) / USDC_DECIMALS)
+            clob_cache = float(bal.get("balance") or 0) / USDC_DECIMALS
         except Exception as e:  # noqa: BLE001
             log.warning("CLOB balance refresh failed: %s", e)
-        try:
-            # Polymarket cash now lives as pUSD in the trading wallet/proxy.
-            # Keep the CLOB balance as a fallback, but don't add them together:
-            # future API versions may report the same pUSD balance directly.
-            balances.append(self._erc20_balance(PUSD, self.address))
-        except Exception as e:  # noqa: BLE001
-            log.warning("pUSD balance refresh failed: %s", e)
-        if balances:
-            self._collateral = max(balances)
+        picked = self._select_collateral(onchain, clob_cache)
+        if picked is not None:
+            self._collateral = picked
 
     def _yes_mid(self, market: Market) -> float | None:
         book = self.tracker.books.get(market.yes_token)
