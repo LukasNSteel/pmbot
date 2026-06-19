@@ -105,6 +105,15 @@ def test_guard_trip_fires_on_trip_callback_once():
     assert fired == [m.condition_id]
 
 
+def test_paused_cids_reports_only_active_cooldowns():
+    g = MarketGuards(CFG)
+    now = time.time()
+    g.trip_market("cid_active", now, "test", "q")
+    assert g.paused_cids(now) == {"cid_active"}
+    # After the cooldown elapses it is no longer reported.
+    assert g.paused_cids(now + g.cooldown + 1) == set()
+
+
 def test_directional_flow_fires_side_block_callback():
     g = MarketGuards(CFG)
     blocked = []

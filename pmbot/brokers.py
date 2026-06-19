@@ -19,6 +19,42 @@ from .strategy import Quote
 log = logging.getLogger("pmbot.broker")
 
 ORDER_RECONCILE_SECONDS = 30.0
+# Substrings that mark a network blip worth retrying (vs a genuine API
+# rejection like "not enough balance"). Seen live as SSL handshake timeouts,
+# read timeouts, and "No route to host" from the CLOB client.
+_TRANSIENT_MARKERS = (
+    "timed out", "timeout", "route to host", "connection", "handshake",
+    "temporarily unavailable", "reset by peer", "request exception",
+    "max retries", "ssl", "eof occurred", "broken pipe",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    return any(m in str(exc).lower() for m in _TRANSIENT_MARKERS)
+
+
+def _with_retry(label: str, fn, attempts: int = 3, base_delay: float = 0.3):
+    """Run a network call, retrying transient failures with backoff.
+
+    Runs on the broker's worker thread (order ops are dispatched via
+    asyncio.to_thread), so the blocking sleep never stalls the event loop. A
+    non-transient error (e.g. an order rejection) is re-raised immediately so
+    callers keep their existing fail-fast / reconcile behavior.
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i == attempts - 1 or not _is_transient(e):
+                raise
+            delay = base_delay * (2 ** i)
+            log.warning("%s transient error (%s); retry %d/%d in %.1fs",
+                        label, e, i + 1, attempts - 1, delay)
+            time.sleep(delay)
+    assert last is not None
+    raise last
 # Polymarket GTD orders carry a 1-minute security threshold: an order with
 # expiration=T is effectively dead at ~T-60s, so quote for ttl seconds we
 # must sign expiration=now+ttl+60 and refresh well before T-60.
@@ -94,7 +130,8 @@ class PaperBroker:
     """Simulates fills against the live book with a queue-position model,
     simulated order latency (placement and cancellation each take
     `latency_secs` — stale quotes stay fillable until the cancel "lands"),
-    depth-aware taker fills, and maker fees."""
+    depth-aware taker fills, and taker fees (makers are never charged on
+    Polymarket, so only the taker_buy path pays a fee)."""
 
     def __init__(self, capital: float, tracker: BookTracker, data_dir: str = "data",
                  latency_secs: float = 0.0):
@@ -114,10 +151,17 @@ class PaperBroker:
         tracker.on_trade(self._on_trade)
 
     def _fee_usd(self, market: Market, price: float, size: float) -> float:
-        """Polymarket fee formula: rate × min(p, 1−p) × shares."""
+        """Taker fee for a fill: rate × (p·(1−p))^exponent × shares.
+
+        Matches Polymarket's protocol formula (fee = C × feeRate × p × (1−p),
+        with fd.e the exponent — 1 for all current markets). Polymarket only
+        charges takers, so this is applied exclusively on the taker_buy (FAK)
+        path; resting maker fills (quotes and exits) pay 0.
+        """
         if market.fee_bps <= 0:
             return 0.0
-        return market.fee_bps / 10000.0 * min(price, 1.0 - price) * size
+        rate = market.fee_bps / 10000.0
+        return rate * (price * (1.0 - price)) ** market.fee_exponent * size
 
     def _start_dying(self, cid: str, st: PaperQuoteState, now: float) -> None:
         """A cancelled/replaced quote rests on the book until the cancel lands."""
@@ -159,6 +203,9 @@ class PaperBroker:
 
     def open_quotes(self, market: Market) -> list[Quote]:
         return [s.quote for s in self._quotes.get(market.condition_id, [])]
+
+    def due_for_refresh(self, market: Market) -> bool:
+        return False
 
     def set_exit(self, market: Market, quote: Quote | None) -> None:
         cid = market.condition_id
@@ -302,8 +349,8 @@ class PaperBroker:
 
     def _fill(self, market: Market, q: Quote, size: float) -> None:
         pos = self.state.positions.setdefault(market.condition_id, Position())
-        fee = self._fee_usd(market, q.price, size)
-        cost = q.price * size + fee
+        # Maker fill: no fee on Polymarket.
+        cost = q.price * size
         self.state.cash -= cost
         if q.token_id == market.yes_token:
             pos.yes_shares += size
@@ -320,16 +367,13 @@ class PaperBroker:
             "market": market.question[:50], "side": side,
             "token": q.token_id, "price": q.price, "size": size, "merged": merged,
         }
-        if fee > 0:
-            entry["fee"] = fee
         self.state.fills_log.append(entry)
         if self.metrics:
             self.metrics.record_fill(entry)
             if merged:
                 self.metrics.record_merge(market.condition_id, merged)
-        log.info("FILL %s %s %.0f @ %.3f (merged %.0f pairs%s)",
-                 market.question[:40], side, size, q.price, merged,
-                 f", fee ${fee:.2f}" if fee > 0 else "")
+        log.info("FILL %s %s %.0f @ %.3f (merged %.0f pairs)",
+                 market.question[:40], side, size, q.price, merged)
         self._persist()
 
     def _fill_exit(self, market: Market, q: Quote, fill_sz: float) -> None:
@@ -344,16 +388,14 @@ class PaperBroker:
             side = "NO"
         if size <= 0:
             return
-        fee = self._fee_usd(market, q.price, size)
-        self.state.cash += q.price * size - fee
+        # Resting limit-sell exit is a maker order: no fee on Polymarket.
+        self.state.cash += q.price * size
         pos.fills += 1
         entry = {
             "ts": time.time(), "cid": market.condition_id,
             "market": market.question[:50], "side": side,
             "token": q.token_id, "price": q.price, "size": size, "exit": True,
         }
-        if fee > 0:
-            entry["fee"] = fee
         self.state.fills_log.append(entry)
         if self.metrics:
             self.metrics.record_fill(entry)
@@ -506,6 +548,12 @@ class LiveBroker:
             )
         self.cfg = cfg
         self.order_ttl = int(cfg["quoting"].get("order_ttl_secs", 90))
+        # Refresh resting quotes by posting the replacement BEFORE cancelling
+        # the expiring order, so a pure GTD refresh never leaves the side off
+        # the book (a momentary double-size overlap until the cancel lands,
+        # which a reward farmer prefers to a reward-scoring gap). Price/size
+        # changes still cancel-first to avoid resting two prices at once.
+        self.refresh_overlap = bool(cfg["quoting"].get("refresh_overlap", True))
         self.rpc_url = cfg["live"].get("rpc_url")
         sig_type = int(cfg["live"]["signature_type"])
         if sig_type in (1, 2, 3) and not funder:
@@ -536,6 +584,7 @@ class LiveBroker:
         # (worker thread) iterates/trims — guard against concurrent mutation.
         self._ws_deltas_lock = threading.Lock()
         self._last_order_reconcile = 0.0
+        self._logged_post_shape = False
         self.metrics = None
         self.merger = None
         if cfg["live"].get("merge_enabled", False):
@@ -658,9 +707,13 @@ class LiveBroker:
     def _batch_cancel(self, order_ids: list[str]) -> bool:
         if not order_ids:
             return True
-        try:
+
+        def _do_cancel():
             with self._client_lock:
                 self.client.cancel_orders(order_ids)
+
+        try:
+            _with_retry("batch cancel", _do_cancel)
             return True
         except Exception as e:  # noqa: BLE001
             from py_clob_client_v2 import OrderPayload
@@ -684,7 +737,8 @@ class LiveBroker:
         desired = {q.token_id: q for q in quotes}
         now = time.time()
         kept: list[RestingOrder] = []
-        to_cancel: list[str] = []
+        cancel_now: list[str] = []     # price/size changed or no longer wanted
+        cancel_after: list[str] = []   # pure expiry refresh — cancel after repost
 
         for ro in self._open_orders.get(market.condition_id, []):
             d = desired.get(ro.quote.token_id)
@@ -693,10 +747,16 @@ class LiveBroker:
             if (d is not None and d.key() == ro.quote.key() and not near_expiry):
                 kept.append(ro)
                 desired.pop(ro.quote.token_id)
+            elif (d is not None and d.key() == ro.quote.key()
+                  and near_expiry and self.refresh_overlap):
+                # Same price/size, only expiring: leave it in `desired` so the
+                # replacement posts first, then cancel the old order below. No
+                # off-book gap, so the reward sampler always sees this side.
+                cancel_after.append(ro.order_id)
             else:
-                to_cancel.append(ro.order_id)
+                cancel_now.append(ro.order_id)
 
-        if not self._batch_cancel(to_cancel):
+        if not self._batch_cancel(cancel_now):
             log.warning("cancel failed in '%s' — reconciling before posting replacements",
                         market.question[:45])
             self.reconcile_orders()
@@ -721,31 +781,58 @@ class LiveBroker:
                     log.error("order build failed %s @ %.3f: %s", q.token_id[:12], q.price, e)
             if batch_args:
                 try:
+                    # NOT retried: a POST that times out after the order landed
+                    # server-side would double-post on retry. Reconcile from
+                    # exchange truth instead (the overlap above keeps the old
+                    # order resting meanwhile, so a failed refresh leaves no gap).
                     with self._client_lock:
                         resp = self.client.post_orders(batch_args)
                     orders = resp if isinstance(resp, list) else resp.get("orders", [resp])
                     for i, item in enumerate(orders):
-                        oid = ""
-                        if isinstance(item, dict):
-                            oid = item.get("orderID") or item.get("orderId") or ""
-                        if oid and i < len(order_map):
+                        if not isinstance(item, dict) or i >= len(order_map):
+                            continue
+                        oid = (item.get("orderID") or item.get("orderId")
+                               or item.get("id") or "")
+                        if oid:
                             placed.append(RestingOrder(
                                 oid, order_map[i], now, self._gtd_expiration()))
+                        else:
+                            # POST /orders returns a 200 array even for per-order
+                            # REJECTIONS: orderID comes back empty with the reason
+                            # in errorMsg. Surface it — a swallowed empty orderID is
+                            # why a quote never rests (and rewards never accrue).
+                            q = order_map[i]
+                            reason = (item.get("errorMsg") or item.get("error")
+                                      or "empty orderID (no reason given)")
+                            log.warning("order rejected %s @ %.3f×%.0f in '%s': %s",
+                                        q.token_id[:12], q.price, q.size,
+                                        market.question[:35], reason)
                 except Exception as e:  # noqa: BLE001
                     log.error("batch post failed; reconciling instead of retrying blindly: %s", e)
                     self.reconcile_orders()
                     return
                 if len(placed) < len(batch_args):
-                    # The post succeeded (no exception) but we parsed fewer order
-                    # IDs than orders sent — the unparsed orders may still be
-                    # resting on the exchange. Trusting empty local state here
-                    # would re-post them next cycle (duplicate stacking), so
-                    # rebuild from exchange truth instead.
-                    log.warning("batch post parsed %d/%d order IDs in '%s' — "
-                                "reconciling to avoid duplicate orders",
-                                len(placed), len(batch_args), market.question[:45])
+                    # One or more legs did not rest (rejected above, or no ID
+                    # returned). Rebuild from exchange truth so we neither trust
+                    # stale local state nor re-post duplicates next cycle.
+                    if not placed and not self._logged_post_shape:
+                        # One-shot: if we couldn't parse ANY id, dump the response
+                        # shape so an unexpected wrapper is diagnosable from logs.
+                        self._logged_post_shape = True
+                        keys = sorted(resp.keys()) if isinstance(resp, dict) else type(resp).__name__
+                        log.warning("post_orders returned no parseable order IDs; "
+                                    "response shape: %s", keys)
                     self.reconcile_orders()
                     return
+
+        # Replacements are now resting; close the overlap by cancelling the
+        # expiring originals. Deferred to here (after a successful post) so a
+        # failed post never leaves a side off the book — the old order stays.
+        if cancel_after and not self._batch_cancel(cancel_after):
+            log.warning("refresh overlap: stale-order cancel failed in '%s' — "
+                        "reconciling", market.question[:45])
+            self.reconcile_orders()
+            return
 
         self._open_orders[market.condition_id] = kept + placed
         if self.metrics:
@@ -782,6 +869,17 @@ class LiveBroker:
 
     def open_quotes(self, market: Market) -> list[Quote]:
         return [ro.quote for ro in self._open_orders.get(market.condition_id, [])]
+
+    def due_for_refresh(self, market: Market) -> bool:
+        """True when a resting order is close enough to GTD expiry that it must
+        be reposted now even if its price/size is unchanged. The quote loop only
+        calls set_quotes on a key-set change, so without this a stable quote is
+        never refreshed and silently expires on the book."""
+        now = time.time()
+        return any(
+            ro.expiration > 0 and ro.expiration - now < GTD_REFRESH_MARGIN_SECS
+            for ro in self._open_orders.get(market.condition_id, [])
+        )
 
     def set_exit(self, market: Market, quote: Quote | None) -> None:
         cid = market.condition_id
@@ -906,9 +1004,12 @@ class LiveBroker:
 
     def reconcile_orders(self) -> None:
         """Rebuild local order state from exchange truth."""
-        try:
+        def _do_fetch():
             with self._client_lock:
-                remote = self.client.get_open_orders()
+                return self.client.get_open_orders()
+
+        try:
+            remote = _with_retry("order reconcile", _do_fetch)
         except Exception as e:  # noqa: BLE001
             log.warning("order reconcile failed: %s", e)
             return

@@ -7,32 +7,64 @@ import logging
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import httpx
-
 log = logging.getLogger("pmbot.metrics")
-
-CLOB_URL = "https://clob.polymarket.com"
 
 
 class MetricsStore:
     def __init__(self, db_path: str = "data/metrics.db",
-                 trades_log: str | None = None):
+                 trades_log: str | None = None,
+                 inception_date: str | None = None):
         self.path = Path(db_path)
         self.path.parent.mkdir(exist_ok=True)
         self._trades_log = Path(trades_log) if trades_log else None
         if self._trades_log:
             self._trades_log.parent.mkdir(exist_ok=True)
+        # Reports reflect bot activity only: drop/refuse anything before this
+        # UTC date (earlier rows were manual testing).
+        self.inception_date = inception_date or None
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        # Tolerate brief contention from a concurrent reader/backfill instead of
+        # raising "database is locked" immediately.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         # Order ops run concurrently in worker threads and all record metrics
         # through this single connection — serialize writes.
         self._lock = threading.Lock()
         self._init_schema()
+        self._prune_before_inception()
         self._uptime_samples: dict[str, list[bool]] = {}
         self._last_uptime_minute: int = 0
         self._session_start = time.time()
+
+    def _inception_ts(self) -> float | None:
+        if not self.inception_date:
+            return None
+        try:
+            return datetime.strptime(self.inception_date, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            log.warning("invalid metrics.inception_date %r; ignoring",
+                        self.inception_date)
+            return None
+
+    def _prune_before_inception(self) -> None:
+        """Delete rows that predate the inception date (manual-testing data)."""
+        ts = self._inception_ts()
+        if ts is None:
+            return
+        with self._lock:
+            for tbl in ("fills", "hedges", "merges", "equity", "markouts",
+                        "quotes"):
+                self._conn.execute(f"DELETE FROM {tbl} WHERE ts < ?", (ts,))
+            self._conn.execute("DELETE FROM uptime WHERE minute_ts < ?",
+                               (int(ts) // 60,))
+            self._conn.execute("DELETE FROM reward_samples WHERE minute_ts < ?",
+                               (int(ts) // 60,))
+            self._conn.execute("DELETE FROM rewards WHERE date < ?",
+                               (self.inception_date,))
+            self._conn.commit()
 
     def _init_schema(self) -> None:
         self._conn.executescript("""
@@ -67,6 +99,12 @@ class MetricsStore:
                 ts REAL, date TEXT, estimated REAL DEFAULT 0,
                 realized REAL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS reward_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                minute_ts INTEGER, cid TEXT, est_usd REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reward_samples_minute
+                ON reward_samples (minute_ts);
             CREATE TABLE IF NOT EXISTS markouts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, fill_ts REAL, cid TEXT, market TEXT,
@@ -166,6 +204,64 @@ class MetricsStore:
                 )
             self._conn.commit()
 
+    def record_reward_sample(self, cid: str, usd: float) -> None:
+        """Per-minute, per-market estimated reward accrual (USD for that minute).
+
+        The daily ``rewards`` table only keeps a running daily total, which
+        makes the reward *rate* invisible — diagnosing intra-session decay
+        meant inferring it from uptime and churn. This table keeps the raw
+        time series (one row per market per ~minute) so the rate is directly
+        observable and changes can be proven rather than inferred.
+        """
+        if usd != usd:  # NaN guard
+            return
+        minute = int(time.time()) // 60
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO reward_samples (minute_ts, cid, est_usd) "
+                "VALUES (?,?,?)",
+                (minute, cid, usd),
+            )
+            self._conn.commit()
+
+    def reward_rate_recent(self, minutes: int = 60) -> dict:
+        """Estimated reward accrual over the last ``minutes``, as a rate.
+
+        Each sample is the USD accrued in its minute, so summing the window
+        gives the dollars accrued in it. ``usd_per_hr`` divides that by the
+        number of *distinct sampled minutes* (not wall-clock), so a bot that
+        only ran part of the window isn't penalised for the idle stretch.
+        """
+        cutoff = int(time.time()) // 60 - int(minutes)
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(est_usd),0), COUNT(DISTINCT minute_ts) "
+            "FROM reward_samples WHERE minute_ts > ?",
+            (cutoff,),
+        ).fetchone()
+        usd, n = (row[0] or 0.0), (row[1] or 0)
+        usd_per_hr = (usd / (n / 60.0)) if n else 0.0
+        return {"usd": usd, "minutes": n, "usd_per_hr": usd_per_hr}
+
+    def reward_rate_by_market(self, since_minute: int) -> dict[str, dict]:
+        """Per-market estimated accrual since ``since_minute`` (a minute_ts).
+
+        Returns ``{cid: {"usd": total, "minutes": n, "usd_per_hr": rate}}`` so
+        you can see which held markets are actually carrying the reward rate.
+        """
+        rows = self._conn.execute(
+            "SELECT cid, COALESCE(SUM(est_usd),0), COUNT(DISTINCT minute_ts) "
+            "FROM reward_samples WHERE minute_ts >= ? GROUP BY cid",
+            (int(since_minute),),
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for cid, usd, n in rows:
+            out[cid] = {
+                "usd": usd or 0.0,
+                "minutes": n or 0,
+                "usd_per_hr": ((usd or 0.0) / (n / 60.0)) if n else 0.0,
+            }
+        return out
+
     def record_realized_reward(self, date: str, usd: float) -> None:
         with self._lock:
             row = self._conn.execute(
@@ -211,31 +307,84 @@ class MetricsStore:
             return 0.0
         return sum(r[0] for r in rows) / len(rows) * 100
 
-    def fetch_realized_rewards(self, client, date: str | None = None) -> float:
-        """Best-effort fetch of realized rewards from CLOB API."""
-        date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        try:
-            from py_clob_client_v2.headers.headers import create_level_2_headers
-            from py_clob_client_v2.clob_types import RequestArgs
+    def uptime_pct_by_market(self, since_minute: int,
+                             min_samples: int = 10) -> dict[str, float]:
+        """In-band uptime % per market over the recent window.
 
-            path = f"/rewards/user?date={date}"
-            request_args = RequestArgs(method="GET", request_path=path)
-            headers = create_level_2_headers(client.signer, client.creds, request_args)
-            resp = httpx.get(f"{CLOB_URL}{path}", headers=headers, timeout=10.0)
-            resp.raise_for_status()
-            data = resp.json()
-            total = 0.0
-            if isinstance(data, list):
-                for item in data:
-                    total += float(item.get("amount") or item.get("reward") or 0)
-            elif isinstance(data, dict):
-                total = float(data.get("total") or data.get("amount") or 0)
-            if total > 0:
-                self.record_realized_reward(date, total)
-            return total
-        except Exception as e:  # noqa: BLE001
-            log.debug("realized rewards fetch failed: %s", e)
+        Used by sticky market selection to decide whether a held market is
+        actually farming rewards (high in-band %) or underperforming. Markets
+        with fewer than ``min_samples`` minutes of history are omitted, so a
+        freshly-entered market is treated as 'performing' (protected) until it
+        has a real track record rather than being evicted on thin data.
+        """
+        rows = self._conn.execute(
+            "SELECT cid, AVG(in_band) * 100.0, COUNT(*) FROM uptime "
+            "WHERE minute_ts >= ? GROUP BY cid",
+            (int(since_minute),),
+        ).fetchall()
+        return {cid: pct for cid, pct, n in rows if n >= min_samples}
+
+    @staticmethod
+    def _sum_earnings(rows) -> float:
+        """USD realized rewards from a /rewards/user[/total] payload.
+
+        The CLOB returns one row per collateral asset:
+        {date, asset_address, maker_address, earnings, asset_rate}. `earnings`
+        is denominated in the asset (pUSD/USDC) and `asset_rate` is its USD
+        price (~1.0), so USD = sum(earnings * asset_rate). Some deployments wrap
+        the list in {"data": [...]}; handle both.
+        """
+        if isinstance(rows, dict):
+            rows = rows.get("data") or rows.get("earnings") or []
+        total = 0.0
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            earnings = float(item.get("earnings") or item.get("amount")
+                             or item.get("reward") or 0.0)
+            rate = float(item.get("asset_rate") or 1.0)
+            total += earnings * rate
+        return total
+
+    def fetch_realized_rewards(self, client, date: str | None = None) -> float:
+        """Realized liquidity rewards (USD) for a UTC day, from the CLOB.
+
+        Uses the authenticated `/rewards/user/total` endpoint via the official
+        client method, which signs the request correctly (L2 HMAC over the bare
+        path), passes the wallet `signature_type`, and handles pagination — the
+        previous hand-rolled call signed the path WITH its query string and
+        omitted signature_type, so it 401'd and silently recorded $0.
+
+        Records the day's realized total so report/backtest can compare it to
+        the estimate. Best-effort: on a transient fetch error we leave any
+        previously recorded value intact (return without overwriting).
+        """
+        date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.inception_date and date < self.inception_date:
             return 0.0
+        try:
+            rows = client.get_total_earnings_for_user_for_day(date)
+        except Exception as e:  # noqa: BLE001
+            log.debug("realized rewards fetch failed for %s: %s", date, e)
+            return 0.0
+        total = self._sum_earnings(rows)
+        self.record_realized_reward(date, total)
+        return total
+
+    def backfill_realized_rewards(self, client, days: int = 7) -> dict[str, float]:
+        """Re-fetch and record realized rewards for the last `days` UTC dates.
+
+        Lets recently-finalized days (rewards post shortly after UTC midnight)
+        and any rows left at $0 by the old bug self-heal. Returns {date: usd}.
+        """
+        out: dict[str, float] = {}
+        today = datetime.now(timezone.utc).date()
+        for d in range(days):
+            date = (today - timedelta(days=d)).strftime("%Y-%m-%d")
+            if self.inception_date and date < self.inception_date:
+                continue
+            out[date] = self.fetch_realized_rewards(client, date)
+        return out
 
     def daily_report(self, date: str | None = None) -> dict:
         """PnL decomposition for a UTC day."""
@@ -300,6 +449,95 @@ class MetricsStore:
             "maker_fills": fill_count,
             "uptime_pct": uptime_pct,
         }
+
+    def reward_totals(self) -> dict:
+        """Realized/estimated rewards, all-time and rolling last 24h.
+
+        Realized rewards are stored per UTC day (the CLOB finalizes them
+        daily), so the 24h figure is the sum over days whose record timestamp
+        falls in the last 24h — in practice today's (and possibly yesterday's
+        just-finalized) total.
+        """
+        realized_total = self._conn.execute(
+            "SELECT COALESCE(SUM(realized),0) FROM rewards").fetchone()[0]
+        est_total = self._conn.execute(
+            "SELECT COALESCE(SUM(estimated),0) FROM rewards").fetchone()[0]
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        realized_24h = self._conn.execute(
+            "SELECT COALESCE(SUM(realized),0) FROM rewards WHERE date=?",
+            (today,)).fetchone()[0]
+        est_24h = self._conn.execute(
+            "SELECT COALESCE(SUM(estimated),0) FROM rewards WHERE date=?",
+            (today,)).fetchone()[0]
+        return {
+            "realized_total": realized_total, "realized_24h": realized_24h,
+            "est_total": est_total, "est_24h": est_24h,
+        }
+
+    def hedge_pnl_totals(self) -> dict:
+        """Estimated P&L of forced hedges, all-time and rolling last 24h.
+
+        A forced hedge taker-buys the complement of a maker leg we already hold;
+        the completed pair then merges back to $1. The realized P&L on a
+        completed pair is
+
+            (1 - hedge_price - basis)
+
+        where `basis` is our cost for the held leg, approximated by the average
+        maker fill price of the *majority* maker side in that market (the side
+        we accumulate is the one that needs hedging). Crucially we cap the
+        number of loss-bearing pairs at the maker shares we actually held —
+        hedge shares beyond that were open taker buys that merged against other
+        flow or resolved, and aren't a realized pairing loss. Hedges in markets
+        with no recorded maker leg are skipped (no basis to estimate from).
+
+        This is an ESTIMATE — lot-level pairing isn't logged, so treat it as
+        indicative, not audited. Realized rewards are exact; for the true
+        bottom line compare deposits vs wallet balance. `spend_*` is the gross
+        taker dollars for reference.
+        """
+        maker: dict[str, dict[str, tuple[float, float]]] = {}
+        for cid, side, notional, shares in self._conn.execute(
+            "SELECT cid, side, COALESCE(SUM(price*size),0), COALESCE(SUM(size),0) "
+            "FROM fills WHERE taker=0 AND exit=0 GROUP BY cid, side"
+        ):
+            avg = (notional / shares) if shares else 0.0
+            maker.setdefault(cid, {})[side] = (avg, shares)
+
+        cutoff = time.time() - 86400
+        agg: dict[str, dict[str, float]] = {}
+        for cid, ts, price, size in self._conn.execute(
+            "SELECT cid, ts, price, size FROM hedges"
+        ):
+            a = agg.setdefault(cid, {"pv": 0.0, "sz": 0.0,
+                                     "pv24": 0.0, "sz24": 0.0})
+            a["pv"] += price * size
+            a["sz"] += size
+            if ts >= cutoff:
+                a["pv24"] += price * size
+                a["sz24"] += size
+
+        out = {"pnl_total": 0.0, "pnl_24h": 0.0, "spend_total": 0.0,
+               "spend_24h": 0.0, "shares_total": 0.0, "shares_24h": 0.0}
+        for cid, a in agg.items():
+            sides = maker.get(cid, {})
+            y_px, y_sz = sides.get("YES", (0.0, 0.0))
+            n_px, n_sz = sides.get("NO", (0.0, 0.0))
+            # The leg we hold (and must hedge) is the majority maker side.
+            basis, held = (y_px, y_sz) if y_sz >= n_sz else (n_px, n_sz)
+            out["spend_total"] += a["pv"]
+            out["shares_total"] += a["sz"]
+            out["spend_24h"] += a["pv24"]
+            out["shares_24h"] += a["sz24"]
+            if held <= 0:
+                continue
+            if a["sz"] > 0:
+                hpx = a["pv"] / a["sz"]
+                out["pnl_total"] += min(a["sz"], held) * (1.0 - hpx - basis)
+            if a["sz24"] > 0:
+                hpx24 = a["pv24"] / a["sz24"]
+                out["pnl_24h"] += min(a["sz24"], held) * (1.0 - hpx24 - basis)
+        return out
 
     def recent_fills(self, limit: int = 50, since_ts: float | None = None,
                      cid: str | None = None) -> list[dict]:

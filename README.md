@@ -48,6 +48,12 @@ with nonzero maker fees are penalized in the score. Filters (all in
 `config.yaml`): minimum pool size, affordable `min_incentive_size`, midpoint
 inside 0.15–0.85, not resolving within a few hours.
 
+Selection is **sticky** (`scanner.sticky_swap`): a market already being quoted
+is kept across rescans as long as it stays eligible, so the bot doesn't churn
+the set (and eat a feed/quote gap) just because the ranking reshuffled. Risk
+guards still rotate a market out on toxicity/volatility/markout; a fresh
+candidate only displaces a held market if it beats it by `swap_score_margin`.
+
 ## How it quotes
 
 - Fair value from microprice (volume-weighted top of book), plus flow-imbalance drift
@@ -56,7 +62,9 @@ inside 0.15–0.85, not resolving within a few hours.
 - Per-market offset adapts from markout data (widen when picked off, tighten when benign)
 - Capital allocated by estimated reward $/day per $ committed per market
 - Inventory skew shifts both quotes to mean-revert accumulated exposure
-- GTD orders (90s TTL) self-expire on crash; the requote loop refreshes them
+- GTD orders (180s TTL) self-expire on crash; the requote loop refreshes them
+  before expiry, posting the replacement before cancelling the old order so the
+  quote never leaves the book between refreshes (no reward-scoring gap)
 
 ## Risk controls
 
@@ -141,7 +149,7 @@ In live mode:
 - Order operations run off the asyncio event loop (no blocking HTTP during quoting)
 - Fills arrive in real time over the authenticated user WebSocket
 - Open orders are reconciled against the exchange every ~30s
-- GTD orders self-expire on crash (90s dead-man switch)
+- GTD orders self-expire on crash (180s dead-man switch)
 - Positions polled every ~12s with WS-fill delta reconciliation
 - Equity includes pUSD cash from `POLYMARKET_FUNDER` plus marked-to-market
   YES/NO positions. This is what drives equity-scaled sizing and loss limits.

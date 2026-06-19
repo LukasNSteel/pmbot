@@ -82,6 +82,10 @@ class BookTracker:
         self._trade_listeners: list = []  # async callbacks (token_id, price, side, size)
         self._stop = False
         self._tasks: list[asyncio.Task] = []
+        # Live websocket handle + a flag so a deliberate resubscribe reconnect
+        # skips the error backoff/warning path used for unexpected drops.
+        self._ws = None
+        self._resubscribing = False
 
     def on_trade(self, callback) -> None:
         self._trade_listeners.append(callback)
@@ -109,12 +113,43 @@ class BookTracker:
             with contextlib.suppress(asyncio.CancelledError):
                 await t
 
+    async def resubscribe(self, token_ids: list[str],
+                          carry: dict[str, Book] | None = None) -> None:
+        """Swap the tracked token set without tearing the tracker down.
+
+        Surviving books keep their state (and their resting quotes keep earning
+        rewards) while only genuinely new tokens are primed over REST. The live
+        websocket is then nudged to reconnect with the new asset list. This
+        replaces the old stop()/recreate/start() dance, which dropped the feed
+        for every market on any single-market swap.
+        """
+        carry = carry or {}
+        new_books: dict[str, Book] = {}
+        new_tokens: list[str] = []
+        for t in token_ids:
+            if t in self.books:
+                new_books[t] = self.books[t]
+            elif t in carry:
+                new_books[t] = carry[t]
+            else:
+                new_books[t] = Book(t)
+                new_tokens.append(t)
+        self.books = new_books
+        if new_tokens:
+            await self._rest_refresh(new_tokens)  # prime only the new books
+        ws = self._ws
+        if ws is not None:
+            self._resubscribing = True
+            with contextlib.suppress(Exception):
+                await ws.close()  # _ws_loop reconnects with the updated asset set
+
     # ------------------------------------------------------------- websocket
 
     async def _ws_loop(self) -> None:
         while not self._stop:
             try:
                 async with websockets.connect(WS_URL, ping_interval=None, ssl=SSL_CONTEXT) as ws:
+                    self._ws = ws
                     await ws.send(json.dumps({"type": "market", "assets_ids": list(self.books)}))
                     log.info("WebSocket subscribed to %d tokens", len(self.books))
                     ping = asyncio.create_task(self._ping(ws))
@@ -128,8 +163,15 @@ class BookTracker:
                         ping.cancel()
             except Exception as e:  # noqa: BLE001 — reconnect on any socket failure
                 if not self._stop:
+                    if self._resubscribing:
+                        # Deliberate close from resubscribe(): reconnect at once
+                        # with the new asset list, no warning or backoff.
+                        self._resubscribing = False
+                        continue
                     log.warning("WebSocket dropped (%s); reconnecting in 3s", e)
                     await asyncio.sleep(3)
+            finally:
+                self._ws = None
 
     @staticmethod
     async def _ping(ws) -> None:

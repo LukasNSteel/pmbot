@@ -119,11 +119,9 @@ def compute_quotes(
 
     offset = max(band * q["offset_frac_of_max_spread"], market.tick)
     offset += adaptive_offset(markout_avg, cfg)
-    if market.fee_bps > 0:
-        # Each fill pays rate × min(p, 1-p) per share; widen so a round trip
-        # at least covers its own fees. Usually pushes quotes out of the
-        # reward band, which is the right outcome for fee markets.
-        offset += market.fee_bps / 10000.0 * min(fair, 1.0 - fair)
+    # No fee widening: on Polymarket makers are never charged fees, so resting
+    # quotes cost nothing per fill. Widening here would only push us out of the
+    # reward band and forfeit rewards. Fees apply solely on taker merges/exits.
 
     base_size = max(market.min_size * q["size_mult_of_min"] * scale, market.min_size)
     size = float(int(base_size * max(0.5, min(2.0, size_factor))))

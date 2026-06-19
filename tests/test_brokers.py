@@ -25,6 +25,123 @@ def _market() -> Market:
     )
 
 
+def test_is_transient_matches_real_live_errors():
+    """Exact strings seen in the live terminal during the slowdown."""
+    from pmbot.brokers import _is_transient
+    assert _is_transient(RuntimeError("_ssl.c:983: The handshake operation timed out"))
+    assert _is_transient(RuntimeError("The read operation timed out"))
+    assert _is_transient(RuntimeError("[Errno 65] No route to host"))
+    assert _is_transient(RuntimeError(
+        "PolyApiException[status_code=None, error_message=Request exception!]"))
+    assert _is_transient(RuntimeError("connection reset by peer"))
+    # A genuine API rejection must NOT be retried.
+    assert not _is_transient(RuntimeError("not enough balance / allowance"))
+    assert not _is_transient(RuntimeError("order rejected: invalid price"))
+
+
+def test_refresh_overlap_keeps_old_order_when_repost_fails():
+    """If the replacement post fails, the expiring order must NOT be cancelled
+    — the side stays on the book (no gap) and we reconcile from truth."""
+    from pmbot.brokers import GTD_REFRESH_MARGIN_SECS, RestingOrder
+
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.refresh_overlap = True
+    stub.metrics = None
+    stub._markets = {}
+    stub._logged_post_shape = False
+    stub._gtd_expiration = lambda: int(time.time()) + 240
+    stub.reconcile_orders = MagicMock()
+
+    cancels = []
+    stub._batch_cancel = lambda ids: (cancels.append(tuple(ids)) or True) if ids else True
+    stub.client.create_order.return_value = object()
+    stub.client.post_orders.return_value = [{}]  # rejection: empty orderID
+
+    q = Quote("yes1", 0.47, 10)
+    near = RestingOrder("oldid", q, time.time(),
+                        int(time.time()) + GTD_REFRESH_MARGIN_SECS - 5)
+    stub._open_orders = {"cid1": [near]}
+
+    LiveBroker.set_quotes(stub, _market(), [q])
+
+    stub.reconcile_orders.assert_called_once()
+    assert cancels == []  # the still-resting old order was never cancelled
+    assert [ro.order_id for ro in stub._open_orders["cid1"]] == ["oldid"]
+
+
+def test_with_retry_retries_transient_then_succeeds(monkeypatch):
+    from pmbot import brokers
+    monkeypatch.setattr(brokers.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("read operation timed out")
+        return "ok"
+
+    assert brokers._with_retry("x", fn) == "ok"
+    assert calls["n"] == 3
+
+
+def test_with_retry_reraises_non_transient_without_retrying(monkeypatch):
+    import pytest
+    from pmbot import brokers
+    monkeypatch.setattr(brokers.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise RuntimeError("order rejected: invalid price")
+
+    with pytest.raises(RuntimeError):
+        brokers._with_retry("x", fn)
+    assert calls["n"] == 1  # fail fast, no retry
+
+
+def test_refresh_overlap_posts_replacement_before_cancelling_old():
+    """A pure GTD refresh must post the new order BEFORE cancelling the old
+    one, so the side is never off the book when rewards are sampled."""
+    from pmbot.brokers import GTD_REFRESH_MARGIN_SECS, RestingOrder
+
+    stub = _order_book_stub()
+    stub._client_lock = threading.RLock()
+    stub.client = MagicMock()
+    stub.refresh_overlap = True
+    stub.metrics = None
+    stub._markets = {}
+    stub._logged_post_shape = False
+    stub._gtd_expiration = lambda: int(time.time()) + 240
+    stub.reconcile_orders = MagicMock()
+
+    calls = []
+
+    def fake_cancel(ids):
+        if ids:
+            calls.append(("cancel", tuple(ids)))
+        return True
+
+    stub._batch_cancel = fake_cancel
+    stub.client.create_order.return_value = object()
+    stub.client.post_orders.side_effect = lambda args: (
+        calls.append(("post", len(args))) or [{"orderID": "newid"}])
+
+    q = Quote("yes1", 0.47, 10)
+    near = RestingOrder("oldid", q, time.time(),
+                        int(time.time()) + GTD_REFRESH_MARGIN_SECS - 5)
+    stub._open_orders = {"cid1": [near]}
+
+    LiveBroker.set_quotes(stub, _market(), [q])
+
+    kinds = [c[0] for c in calls]
+    assert "post" in kinds and "cancel" in kinds
+    assert kinds.index("post") < kinds.index("cancel")  # overlap: no gap
+    assert calls[-1] == ("cancel", ("oldid",))
+    assert [ro.order_id for ro in stub._open_orders["cid1"]] == ["newid"]
+
+
 def test_parse_fill_amount_from_taking_amount():
     assert _parse_fill_amount({"takingAmount": "5.0"}, 10.0) == 5.0
 
@@ -113,14 +230,42 @@ def test_paper_taker_buy_respects_displayed_depth():
     assert filled == 5.0  # only the 0.50 level is inside the price cap
 
 
-def test_paper_fill_charges_fee():
+def test_paper_maker_fill_charges_no_fee():
+    """Makers are never charged fees on Polymarket, even in fee-enabled
+    markets — a resting quote fill costs only price × size."""
     tracker = BookTracker(["yes1", "no1"])
     broker = PaperBroker(500.0, tracker)
     m = _market()
     m.fee_bps = 200
     broker._fill(m, Quote("yes1", 0.40, 10), 10)
-    # fee = 200/10000 * min(0.40, 0.60) * 10 = 0.08
-    assert abs(broker.state.cash - (500.0 - 4.0 - 0.08)) < 1e-9
+    assert abs(broker.state.cash - (500.0 - 4.0)) < 1e-9
+    assert "fee" not in broker.fills_log[0]
+
+
+def test_paper_maker_exit_charges_no_fee():
+    tracker = BookTracker(["yes1", "no1"])
+    broker = PaperBroker(500.0, tracker)
+    m = _market()
+    m.fee_bps = 200
+    broker.state.positions["cid1"] = Position(yes_shares=10)
+    broker._fill_exit(m, Quote("yes1", 0.60, 10), 10)
+    assert abs(broker.state.cash - (500.0 + 6.0)) < 1e-9
+    assert "fee" not in broker.fills_log[0]
+
+
+def test_paper_taker_buy_charges_fee():
+    """Only the taker path crosses the spread, so it is the only place a
+    Polymarket fee applies."""
+    tracker = BookTracker(["yes1", "no1"])
+    tracker.books["no1"].asks = {0.40: 10.0}
+    broker = PaperBroker(500.0, tracker)
+    m = _market()
+    m.fee_bps = 200
+    filled = broker.taker_buy(m, "no1", 10.0, max_price=0.41)
+    assert filled == 10.0
+    # cost 4.0 + fee 200/10000 * (0.40 * 0.60) * 10 = 0.048
+    assert abs(broker.state.cash - (500.0 - 4.0 - 0.048)) < 1e-9
+    assert abs(broker.fills_log[0]["fee"] - 0.048) < 1e-9
 
 
 def test_paper_exit_requires_queue_or_through_print():
@@ -191,6 +336,30 @@ def _order_book_stub():
     stub._open_orders = {}
     stub._exit_orders = {}
     return stub
+
+
+def test_due_for_refresh_flags_near_expiry_orders():
+    """A stable quote (unchanged key-set) must still be reposted before its GTD
+    order expires, or it silently disappears from the book."""
+    from types import SimpleNamespace
+    from pmbot.brokers import GTD_REFRESH_MARGIN_SECS, RestingOrder
+
+    stub = _order_book_stub()
+    mkt = SimpleNamespace(condition_id="cid1")
+    now = time.time()
+
+    fresh = RestingOrder("o1", Quote("yes1", 0.47, 10), now,
+                         int(now) + GTD_REFRESH_MARGIN_SECS + 60)
+    stub._open_orders = {"cid1": [fresh]}
+    assert LiveBroker.due_for_refresh(stub, mkt) is False
+
+    expiring = RestingOrder("o1", Quote("yes1", 0.47, 10), now,
+                            int(now) + GTD_REFRESH_MARGIN_SECS - 5)
+    stub._open_orders = {"cid1": [expiring]}
+    assert LiveBroker.due_for_refresh(stub, mkt) is True
+
+    stub._open_orders = {}
+    assert LiveBroker.due_for_refresh(stub, mkt) is False
 
 
 def test_apply_fill_partial_decrements_resting_order():

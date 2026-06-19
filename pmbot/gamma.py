@@ -32,7 +32,11 @@ class Market:
     end_date: datetime | None
     neg_risk: bool
     event_id: str | None = None
+    # Taker fee rate in bps (fd.r × 10000) and its exponent (fd.e), from the
+    # CLOB clob-markets endpoint. Makers are never charged on Polymarket, so
+    # this only prices crossing the spread on a merge/exit.
     fee_bps: int = 0
+    fee_exponent: float = 1.0
     best_bid: float | None = None
     best_ask: float | None = None
     last_trade: float | None = None
@@ -98,20 +102,34 @@ def _parse_market(m: dict) -> Market | None:
     )
 
 
-def _fetch_fee_bps(token_id: str, cache: dict[str, int | None]) -> int | None:
-    if token_id in cache:
-        return cache[token_id]
+def _fetch_market_fees(
+    condition_id: str, cache: dict[str, tuple[int, float] | None]
+) -> tuple[int, float] | None:
+    """Authoritative per-market fee from the CLOB clob-markets endpoint.
+
+    Returns (taker_fee_bps, exponent), or None on failure so the caller skips
+    the market (fail closed). Polymarket charges only takers (fd.to), so this
+    rate prices crossing the spread on a merge/exit — our resting maker quotes
+    pay nothing. We read fd.r directly because the legacy /fee-rate endpoint
+    (and the mbf/tbf base-fee fields) report a flat 1000 that does not reflect
+    the real fee rate.
+    """
+    if condition_id in cache:
+        return cache[condition_id]
     try:
         with httpx.Client(timeout=5.0) as client:
-            resp = client.get(f"{CLOB_URL}/fee-rate", params={"token_id": token_id})
+            resp = client.get(f"{CLOB_URL}/clob-markets/{condition_id}")
             resp.raise_for_status()
-            fee = int(resp.json().get("base_fee") or 0)
+            fd = resp.json().get("fd") or {}
+        rate = float(fd.get("r") or 0.0)
+        exponent = float(fd.get("e") or 1.0)
+        result: tuple[int, float] | None = (round(rate * 10000), exponent)
     except Exception as e:  # noqa: BLE001
-        log.warning("fee-rate fetch failed for %s…; skipping market: %s",
-                    token_id[:12], e)
-        fee = None
-    cache[token_id] = fee
-    return fee
+        log.warning("clob-markets fetch failed for %s…; skipping market: %s",
+                    condition_id[:12], e)
+        result = None
+    cache[condition_id] = result
+    return result
 
 
 def fetch_reward_markets() -> list[Market]:
@@ -152,13 +170,31 @@ def fetch_reward_markets() -> list[Market]:
     return markets
 
 
-def scan(cfg: dict) -> list[Market]:
-    """Filter and rank reward markets per scanner config. Returns best first."""
+def scan(cfg: dict, exclude_cids: set[str] | None = None,
+         full: bool = False) -> list[Market]:
+    """Filter and rank reward markets per scanner config. Returns best first.
+
+    `exclude_cids` skips specific markets before ranking, so the next-best
+    eligible markets backfill the top_n slots — used to rotate out of a
+    guard-tripped market into a fresh one instead of wasting the slot.
+
+    `full=True` returns every eligible market (best first) instead of just the
+    top_n slice, so the caller can run its own sticky selection (keep markets
+    we are already quoting unless a candidate is materially better). Fee lookups
+    already run for every market that clears the cheap filters, so returning the
+    full list costs nothing extra.
+    """
     sc = cfg["scanner"]
+    skip_cids = exclude_cids or set()
     lo, hi = sc["mid_range"]
     min_end = datetime.now(timezone.utc) + timedelta(hours=sc["min_hours_to_end"])
     exclude = [k.lower() for k in sc.get("exclude_keywords") or []]
     max_capital = cfg["quoting"]["max_capital_per_market"]
+    # Absolute book-liquidity floor (USD). The reward-density ranking
+    # (pool ÷ liquidity) structurally prefers thin books, which then trip the
+    # volatility / book-not-quotable guards and tank in-band uptime. This floor
+    # drops books too shallow to two-side without getting picked off. 0 disables.
+    min_liquidity = float(sc.get("min_liquidity", 0.0))
     fee_penalty = float(sc.get("fee_penalty_mult", 0.5))
     max_fee_bps = int(sc.get("max_fee_bps", 0))
     # Option C — reward-density ranking adjusted for toxicity & band room.
@@ -168,10 +204,14 @@ def scan(cfg: dict) -> list[Market]:
     turnover_w = float(sc.get("toxicity_turnover_penalty", 0.0))
     band_w = float(sc.get("band_room_bonus", 0.0))
 
-    fee_cache: dict[str, int | None] = {}
+    fee_cache: dict[str, tuple[int, float] | None] = {}
     candidates = []
     for m in fetch_reward_markets():
+        if m.condition_id in skip_cids:
+            continue
         if m.daily_pool < sc["min_pool_per_day"]:
+            continue
+        if m.liquidity < min_liquidity:
             continue
         if m.min_size <= 0 or m.min_size > sc["max_min_size_shares"]:
             continue
@@ -185,16 +225,18 @@ def scan(cfg: dict) -> list[Market]:
             continue
         if m.min_size * 1.0 > max_capital:
             continue
-        fee_bps = _fetch_fee_bps(m.yes_token, fee_cache)
-        if fee_bps is None:
+        fees = _fetch_market_fees(m.condition_id, fee_cache)
+        if fees is None:
             continue
-        m.fee_bps = fee_bps
+        m.fee_bps, m.fee_exponent = fees
         if m.fee_bps > max_fee_bps:
-            # At 1000bps a fill at mid 0.50 costs 5c/share — more than the
-            # whole reward band. Fee markets are unquotable for this strategy.
+            # Guard against pathological fee rates. Makers pay no fee on
+            # Polymarket, so our reward quotes are unaffected; this only caps
+            # markets where the taker merge/exit cost would be extreme.
             continue
         density = m.daily_pool / max(m.liquidity, 100.0)
         if m.fee_bps > 0:
+            # Slight down-rank: taker merges/exits cost more in fee markets.
             density *= max(0.1, 1.0 - m.fee_bps / 10000.0 * fee_penalty)
         # Eligibility gate is on raw reward density — unchanged behavior.
         if density < sc["min_pool_to_liquidity"]:
@@ -210,4 +252,6 @@ def scan(cfg: dict) -> list[Market]:
         candidates.append(m)
 
     candidates.sort(key=lambda m: m.score, reverse=True)
+    if full:
+        return candidates
     return candidates[: sc["top_n_markets"]]

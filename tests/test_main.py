@@ -99,3 +99,154 @@ def test_schedule_pull_without_running_loop_is_noop(tmp_path):
     bot._schedule_market_pull("cid1")  # must not raise outside a loop
     assert not bot._pull_tasks
     bot.metrics.close()
+
+
+def _scored(cid: str, score: float) -> Market:
+    m = Market(
+        question=f"market {cid}", condition_id=cid,
+        yes_token=f"{cid}y", no_token=f"{cid}n", min_size=10,
+        max_spread_cents=3, daily_pool=100, liquidity=5000,
+        volume_24h=0, tick=0.01, end_date=None, neg_risk=False,
+    )
+    m.score = score
+    return m
+
+
+def test_sticky_keeps_held_market_over_marginally_better(tmp_path):
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": True,
+                          "swap_score_margin": 0.25}
+    bot.markets = [_scored("held", 1.0)]
+    # a newcomer scoring 1.1 does NOT clear 0.9 * 1.25 = 1.125 → held is kept.
+    chosen = bot._select_markets([_scored("new", 1.1), _scored("held", 0.9)])
+    assert [m.condition_id for m in chosen] == ["held"]
+    bot.metrics.close()
+
+
+def _seed_uptime(bot, cid: str, in_band: bool, minutes: int = 15) -> None:
+    now_min = int(time.time() // 60)
+    with bot.metrics._lock:
+        for i in range(minutes):
+            bot.metrics._conn.execute(
+                "INSERT INTO uptime (minute_ts, cid, in_band) VALUES (?,?,?)",
+                (now_min - i, cid, int(in_band)))
+        bot.metrics._conn.commit()
+
+
+def test_sticky_displaces_underperforming_held_on_large_margin(tmp_path):
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": True,
+                          "swap_score_margin": 0.25, "underperform_uptime_pct": 60}
+    bot.markets = [_scored("held", 1.0)]
+    _seed_uptime(bot, "held", in_band=False)  # 0% uptime → underperforming
+    # 2.0 >= 1.0 * 1.25 AND held underperforming → the better market wins.
+    chosen = bot._select_markets([_scored("new", 2.0), _scored("held", 1.0)])
+    assert [m.condition_id for m in chosen] == ["new"]
+    bot.metrics.close()
+
+
+def test_sticky_protects_performing_held_even_from_much_better(tmp_path):
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": True,
+                          "swap_score_margin": 0.25, "underperform_uptime_pct": 60}
+    bot.markets = [_scored("held", 1.0)]
+    _seed_uptime(bot, "held", in_band=True)  # 100% uptime → farming well
+    # Even a 10x-better candidate must NOT evict a market that is performing.
+    chosen = bot._select_markets([_scored("new", 10.0), _scored("held", 1.0)])
+    assert [m.condition_id for m in chosen] == ["held"]
+    bot.metrics.close()
+
+
+def test_sticky_protects_freshly_entered_held_with_thin_history(tmp_path):
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": True,
+                          "swap_score_margin": 0.25, "underperform_uptime_pct": 60}
+    bot.markets = [_scored("held", 1.0)]
+    _seed_uptime(bot, "held", in_band=False, minutes=3)  # below min_samples
+    # Too little history to judge → treated as performing → protected.
+    chosen = bot._select_markets([_scored("new", 10.0), _scored("held", 1.0)])
+    assert [m.condition_id for m in chosen] == ["held"]
+    bot.metrics.close()
+
+
+def test_sticky_drops_ineligible_held_and_backfills(tmp_path):
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 1, "sticky_swap": True,
+                          "swap_score_margin": 0.25}
+    bot.markets = [_scored("held", 1.0)]
+    # held no longer appears in the ranked (ineligible) → slot backfills.
+    chosen = bot._select_markets([_scored("other", 0.5)])
+    assert [m.condition_id for m in chosen] == ["other"]
+    bot.metrics.close()
+
+
+def test_rescan_is_sticky_and_swaps_incrementally(tmp_path, monkeypatch):
+    """End-to-end: a reshuffled re-rank must not churn the set, and a genuine
+    swap must reuse the tracker (resubscribe) instead of stop()/start()."""
+    from pmbot import gamma as gamma_mod
+    from pmbot.books import BookTracker
+
+    counts = {"resub": 0, "stop": 0, "start": 0}
+
+    async def fake_start(self):
+        counts["start"] += 1
+
+    async def fake_stop(self):
+        counts["stop"] += 1
+
+    async def fake_resub(self, token_ids, carry=None):
+        counts["resub"] += 1
+        self.books = {t: self.books.get(t) or __import__(
+            "pmbot.books", fromlist=["Book"]).Book(t) for t in token_ids}
+
+    monkeypatch.setattr(BookTracker, "start", fake_start)
+    monkeypatch.setattr(BookTracker, "stop", fake_stop)
+    monkeypatch.setattr(BookTracker, "resubscribe", fake_resub)
+
+    ranked_holder = {"v": []}
+    monkeypatch.setattr(gamma_mod, "scan",
+                        lambda cfg, exclude=None, full=False: list(ranked_holder["v"]))
+
+    async def scenario():
+        bot = _bot(tmp_path)
+        bot.cfg = dict(bot.cfg)
+        bot.cfg["paper"] = {}
+        bot.cfg["risk"] = {}
+        bot.cfg["quoting"] = {"max_capital_per_market": 50}
+        bot.cfg["scanner"] = {
+            "top_n_markets": 2, "sticky_swap": True, "swap_score_margin": 0.25,
+            "underperform_uptime_pct": 60, "underperform_lookback_minutes": 30,
+            "refresh_minutes": 30,
+        }
+
+        a, b, c = _scored("A", 3.0), _scored("B", 2.0), _scored("C", 1.0)
+        ranked_holder["v"] = [a, b, c]
+        await bot._rescan(initial=True)
+        assert {m.condition_id for m in bot.markets} == {"A", "B"}
+        assert counts["start"] == 1 and counts["resub"] == 0
+
+        # Re-rank reshuffles scores but the same cids stay best → NO churn.
+        ranked_holder["v"] = [_scored("B", 3.0), _scored("A", 2.0), _scored("C", 1.0)]
+        await bot._rescan()
+        assert {m.condition_id for m in bot.markets} == {"A", "B"}
+        assert counts["resub"] == 0 and counts["stop"] == 0  # nothing torn down
+
+        # A held market (A) drops out of eligibility → real swap to C.
+        ranked_holder["v"] = [_scored("B", 3.0), _scored("C", 1.0)]
+        await bot._rescan()
+        assert {m.condition_id for m in bot.markets} == {"B", "C"}
+        assert counts["resub"] == 1   # incremental resubscribe used…
+        assert counts["stop"] == 0    # …and the tracker was never torn down
+        bot.metrics.close()
+
+    asyncio.run(scenario())
+
+
+def test_sticky_disabled_returns_plain_top_n(tmp_path):
+    bot = _bot(tmp_path)
+    bot.cfg["scanner"] = {"top_n_markets": 2, "sticky_swap": False}
+    bot.markets = [_scored("held", 1.0)]
+    chosen = bot._select_markets(
+        [_scored("a", 3), _scored("b", 2), _scored("c", 1)])
+    assert [m.condition_id for m in chosen] == ["a", "b"]
+    bot.metrics.close()

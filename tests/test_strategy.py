@@ -130,20 +130,19 @@ def test_compute_quotes_size_never_below_min_incentive_size():
     assert all(q.size >= m.min_size for q in quotes)
 
 
-def test_compute_quotes_fee_market_widens_out_of_band():
-    """A 1000bps fee (~5c/share at mid 0.50) dwarfs the 3c reward band, so a
-    fee market must produce no quotes rather than bleed fees on every fill."""
-    m = _market(fee_bps=1000)
-    assert compute_quotes(m, _book(), 0.0, CFG, 60.0) == []
-
-
-def test_compute_quotes_small_fee_widens_offset():
+def test_compute_quotes_fee_market_does_not_widen():
+    """Makers are never charged fees on Polymarket, so the market fee rate must
+    not affect resting quotes — widening would only forfeit reward-band rewards.
+    A fee market should produce the same quotes as a fee-free one."""
     free = compute_quotes(_market(), _book(), 0.0, CFG, 60.0)
-    feed = compute_quotes(_market(fee_bps=200), _book(), 0.0, CFG, 60.0)
-    assert free and feed
-    free_yes = next(q for q in free if q.token_id == "yes_tok")
-    fee_yes = next(q for q in feed if q.token_id == "yes_tok")
-    assert fee_yes.price < free_yes.price
+    fee_low = compute_quotes(_market(fee_bps=200), _book(), 0.0, CFG, 60.0)
+    fee_high = compute_quotes(_market(fee_bps=1000), _book(), 0.0, CFG, 60.0)
+    assert free and fee_low and fee_high
+    for feed in (fee_low, fee_high):
+        for f, q in zip(free, feed):
+            assert f.token_id == q.token_id
+            assert f.price == q.price
+            assert f.size == q.size
 
 
 def test_adaptive_offset_widens_on_negative_markout():

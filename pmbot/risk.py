@@ -184,6 +184,10 @@ class MarketGuards:
     def allow(self, cid: str, now: float) -> bool:
         return now >= self._paused_until.get(cid, 0.0)
 
+    def paused_cids(self, now: float) -> set[str]:
+        """Markets currently inside their trip cooldown (not quotable now)."""
+        return {cid for cid, until in self._paused_until.items() if now < until}
+
     def _trip(self, cid: str, now: float, reason: str, question: str) -> None:
         newly_tripped = self.allow(cid, now)
         if newly_tripped:

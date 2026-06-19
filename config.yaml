@@ -23,7 +23,13 @@ scanner:
   # this only as you add capital.
   top_n_markets: 2
   # Ignore markets whose daily reward pool is below this (USD/day).
-  min_pool_per_day: 25
+  min_pool_per_day: 75
+  # Absolute book-liquidity floor (USD). The reward-density ranking below
+  # (pool ÷ liquidity) structurally favors THIN books, which then trip the
+  # volatility / book-not-quotable guards and tank in-band uptime (e.g. a $431
+  # book quoting two-sided). This drops books too shallow to make on safely.
+  # 0 disables. Tune against `scan` output — too high starves the scanner.
+  min_liquidity: 5000
   # Ignore markets requiring quotes bigger than this (shares) — keeps
   # per-market capital small.
   max_min_size_shares: 100
@@ -40,17 +46,22 @@ scanner:
   #     still merge pairs near $1.00). score *= 1 + w * (max_spread_cents - 1).
   toxicity_turnover_penalty: 0.05
   band_room_bonus: 0.10
-  # Hard cap on market fee rate (basis points). Fees are charged per fill as
-  # rate × min(p, 1-p) × shares — at 1000bps that's ~5c/share at mid 0.50,
-  # several times any spread we can capture inside the reward band. Default 0:
-  # never quote fee-enabled markets.
-  max_fee_bps: 0
-  # Penalize score for markets with nonzero maker fees (0.5 = halve score at 100bps).
+  # Hard cap on market fee rate (basis points), as reported by the CLOB
+  # /fee-rate endpoint. On Polymarket makers are NEVER charged fees, so our
+  # resting reward quotes pay nothing regardless of this value — the only fee
+  # cost is when we cross the spread to merge/exit (taker_buy). This cap is
+  # therefore just a guard against pathological markets; keep it high so we
+  # don't needlessly skip fee-enabled markets we can still make on profitably.
+  max_fee_bps: 1000
+  # Mildly down-rank fee-enabled markets in scoring to reflect that taker
+  # merges/exits there cost more (0.5 = halve the penalty term at 100bps).
   # Only relevant for markets that pass max_fee_bps.
   fee_penalty_mult: 0.5
   # Only quote markets whose midpoint is inside this range. Outside it,
-  # rewards require two-sided depth anyway and tail risk is worse.
-  mid_range: [0.15, 0.85]
+  # rewards require two-sided depth anyway and tail risk is worse. Narrowed
+  # from [0.15, 0.85]: at a low/high mid a few-tick move is a large *cent*
+  # swing, so extreme-priced books trip the 3c volatility guard constantly.
+  mid_range: [0.25, 0.75]
   # Skip markets resolving sooner than this many hours. Keep this at or above
   # risk.derisk_hours_before_end so freshly scanned markets aren't entered
   # already inside the de-risk/exit window (which would quote them at a shrunk
@@ -58,6 +69,33 @@ scanner:
   min_hours_to_end: 14
   # Re-run the scanner this often to rotate into fresh markets.
   refresh_minutes: 30
+  # Sticky selection (reward-farmer friendly). When true, markets we are
+  # already quoting are KEPT across rescans as long as they stay eligible —
+  # we don't churn the set just because the pool÷liquidity ranking reshuffled.
+  # Leaving a market costs a feed/quote gap and lost queue position, so for a
+  # reward farmer stickiness beats chasing a marginally higher-ranked market.
+  # Guard trips (toxicity/markout/volatility/flow) still rotate a market out
+  # via the normal risk path; this only suppresses score-churn swaps.
+  sticky_swap: true
+  # A fresh candidate only displaces a market we already hold if its score
+  # beats the weakest held market's score by at least this fraction (0.25 =
+  # 25% better) AND that held market is underperforming (see below). Higher =
+  # stickier (≈ "only swap on risk or a much better market"); 0 = never
+  # displace a held market on score alone.
+  swap_score_margin: 0.25
+  # A held market is only eligible for score-based displacement if its recent
+  # in-band uptime is below this percentage — i.e. it isn't actually farming
+  # the rewards its rank implies. A market quoting well above this is protected
+  # from churn no matter how the ranking reshuffles. Markets with too little
+  # history (just entered) are treated as performing and protected.
+  underperform_uptime_pct: 60
+  underperform_lookback_minutes: 30
+  # When a market trips its guard (e.g. 45-min volatility cooldown), don't leave
+  # the quoting slot idle until the next refresh — immediately rescan and rotate
+  # into the next-best eligible market. Only flat tripped markets are rotated
+  # out; ones still holding inventory stay so the exit path manages them.
+  # Debounced by ROTATE_MIN_INTERVAL_SECS to avoid book-feed churn.
+  rotate_on_trip: true
   # Skip markets whose question contains any of these (case-insensitive).
   # Event-driven / observation-driven books: guards trip constantly and
   # inventory stacks across correlated markets (Iran dates, Seoul temps, etc.).
@@ -79,6 +117,26 @@ scanner:
     - up or down
     - gold
     - xauusd
+    # Commodity & crypto price-tracking books: the mid follows a live external
+    # price feed, so maker quotes get picked off faster than they can be pulled
+    # — same risk profile as the spx/gold entries above. Surfaced by the scan
+    # (WTI crude, natural gas) once fee-enabled markets became eligible.
+    - crude
+    - wti
+    - brent
+    - natural gas
+    - nat gas
+    - bitcoin
+    - btc
+    - ethereum
+    - solana
+    # Valuation-tracking books (e.g. "SpaceX market cap between $2.5T and $3T")
+    # jump on discrete funding/IPO news that picks off resting quotes.
+    - market cap
+    # Price-touch / barrier books phrased "... hit (LOW)/(HIGH) $X": a continuous
+    # external price crossing a fixed level is pure adverse selection for a maker.
+    - "hit (low)"
+    - "hit (high)"
     # Event / announcement-driven books: a single headline moves the mid faster
     # than quotes can be pulled, so maker fills get picked off and the forced
     # hedge pays up. These produced ~75% of live trading losses (see session
@@ -109,8 +167,20 @@ quoting:
   max_capital_per_market: 50
   # How aggressively to skew quotes against accumulated inventory (0..1).
   skew_strength: 0.6
-  # GTD order lifetime (seconds). Orders self-expire on crash; requote loop refreshes.
-  order_ttl_secs: 90
+  # GTD order lifetime (seconds). Orders self-expire on crash; the requote loop
+  # refreshes them well before expiry. Longer TTL = fewer cancel/repost cycles
+  # (each cycle is a network round trip that can stall on a flaky link and a
+  # brief reward-scoring gap), at the cost of more standing exposure if the bot
+  # crashes (orders rest up to ttl+60s before self-expiring). 180s is a good
+  # balance for a small book; the dead-man switch still fires quickly enough.
+  order_ttl_secs: 180
+  # Close the per-refresh reward gap: when a resting quote is only expiring
+  # (same price/size), post its replacement BEFORE cancelling the old order so
+  # the side is never off the book when Polymarket samples the book for reward
+  # scoring. Costs a sub-second double-size overlap until the cancel lands —
+  # which a reward farmer prefers to a scoring gap. Price/size changes still
+  # cancel-first. Set false to revert to plain cancel-then-repost.
+  refresh_overlap: true
   # Don't quote unless book spread <= this multiple of the reward band.
   max_book_spread_mult_of_band: 3.0
   # Max quote-center drift from signed flow imbalance (cents).
@@ -244,6 +314,10 @@ metrics:
   db_path: data/live_metrics.db
   # Append-only JSONL of every fill — easy to grep, import into pandas, etc.
   trades_log: data/live_trades.jsonl
+  # Ignore anything before this UTC date (earlier rows were manual testing, not
+  # bot activity). Pre-inception rows are pruned on startup and reward backfills
+  # never write dates before it, so all reports reflect bot trading only.
+  inception_date: "2026-06-14"
 
 # Self-managing controller: rewrites the knobs below in place from live equity
 # and the rolling markout (post-fill price drift = adverse selection). Two

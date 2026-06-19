@@ -41,8 +41,21 @@ POSITION_REFRESH_SECONDS = 12.0
 MERGE_CHECK_SECONDS = 60.0
 FLATTEN_RETRY_SECONDS = 15.0
 MIN_TAKER_SHARES = 5.0
-REALIZED_REWARD_FETCH_SECONDS = 3600.0
+# Refresh realized rewards every 30s — matches the status-print cadence so the
+# report is at most one tick stale. Each fetch is two light API calls (today +
+# yesterday) on a background thread, so it never blocks quoting. Rewards accrue
+# in ~1-min epochs, so this already polls at/above the source's update rate;
+# going faster just re-pulls identical data.
+REALIZED_REWARD_FETCH_SECONDS = 30.0
 SCAN_RETRY_SECONDS = 60.0
+# When a market trips its guard, rotate into the next-best market instead of
+# leaving the slot idle for the whole cooldown. Debounced so a burst of trips
+# can't thrash the book-tracker (each rotation resubscribes the feed).
+ROTATE_MIN_INTERVAL_SECS = 60.0
+# Only rotate OUT of a tripped market if it is essentially flat — a tripped
+# market still holding inventory stays in the set so the normal de-risk/exit
+# path manages it (dropping it would force an immediate liquidation).
+ROTATE_FLAT_USD = 1.0
 
 
 def hours_to_end(market: gamma.Market, now: float) -> float | None:
@@ -73,12 +86,15 @@ def cmd_scan(cfg: dict) -> None:
 def _metrics_store(cfg: dict) -> MetricsStore:
     m = cfg.get("metrics") or {}
     return MetricsStore(m.get("db_path", "data/metrics.db"),
-                        trades_log=m.get("trades_log"))
+                        trades_log=m.get("trades_log"),
+                        inception_date=m.get("inception_date"))
 
 
 def cmd_report(cfg: dict) -> None:
     store = _metrics_store(cfg)
     report = store.daily_report()
+    rewards = store.reward_totals()
+    hedge = store.hedge_pnl_totals()
     store.close()
     table = Table(title=f"PnL report — {report['date']}")
     table.add_column("Component")
@@ -95,6 +111,25 @@ def cmd_report(cfg: dict) -> None:
     table.add_row("Maker fills", str(report["maker_fills"]))
     table.add_row("In-band uptime", f"{report['uptime_pct']:.1f}%")
     console.print(table)
+
+    score = Table(title="Scoreboard — rewards vs hedge cost")
+    score.add_column("Metric")
+    score.add_column("All-time", justify="right")
+    score.add_column("Last 24h", justify="right")
+    score.add_row("Realized rewards (exact)",
+                  f"${rewards['realized_total']:+.2f}",
+                  f"${rewards['realized_24h']:+.2f}")
+    score.add_row("Hedge P&L (est., forced pairings)",
+                  f"${hedge['pnl_total']:+.2f}",
+                  f"${hedge['pnl_24h']:+.2f}")
+    console.print(score)
+    console.print(
+        f"[dim]Realized rewards are exact cash. Hedge P&L is an ESTIMATE of the "
+        f"loss on completable forced pairs (gross taker spend "
+        f"${hedge['spend_total']:.0f} all-time / ${hedge['spend_24h']:.0f} 24h); "
+        f"lot-level pairing isn't logged, so treat it as indicative. Compare "
+        f"deposits vs wallet balance for the audited bottom line.[/]"
+    )
 
 
 def _fmt_ts(ts: float) -> str:
@@ -214,6 +249,8 @@ class Bot:
         self._token_market: dict[str, gamma.Market] = {}
         self._size_factors: dict[str, float] = {}
         self._last_scan = 0.0
+        self._last_rotate = 0.0
+        self._rotate_pending = False
         self._last_reward_sample = 0.0
         self._last_status = 0.0
         self._last_pos_refresh = 0.0
@@ -247,6 +284,9 @@ class Bot:
                 now = time.time()
                 if now - self._last_scan > self.cfg["scanner"]["refresh_minutes"] * 60:
                     await self._rescan()
+                elif (self._rotate_pending
+                      and now - self._last_rotate > ROTATE_MIN_INTERVAL_SECS):
+                    await self._rescan(rotate=True)
                 self.broker.check_crossed_books()
                 if not self.paper and now - self._last_pos_refresh >= POSITION_REFRESH_SECONDS:
                     await asyncio.to_thread(self.broker.refresh_state)
@@ -260,8 +300,11 @@ class Bot:
                 if (not self.paper and now - self._last_realized_reward
                         >= REALIZED_REWARD_FETCH_SECONDS):
                     self._last_realized_reward = now
+                    # Today plus the prior UTC day: a day's rewards finalize
+                    # shortly after midnight UTC, so refreshing yesterday keeps
+                    # the realized-vs-estimated record accurate.
                     await asyncio.to_thread(
-                        self.metrics.fetch_realized_rewards, self.broker.client)
+                        self.metrics.backfill_realized_rewards, self.broker.client, 2)
 
                 equity = self.broker.equity()
                 self.controller.maybe_apply(now, equity)
@@ -339,6 +382,10 @@ class Bot:
 
     def _schedule_market_pull(self, cid: str) -> None:
         self._spawn_pull(self._pull_market_quotes(cid))
+        # A fresh trip frees (or idles) a quoting slot — ask the loop to look
+        # for a replacement market on its next tick.
+        if (self.cfg.get("scanner") or {}).get("rotate_on_trip", True):
+            self._rotate_pending = True
 
     def _schedule_side_pull(self, token_id: str) -> None:
         self._spawn_pull(self._pull_side_quote(token_id))
@@ -374,14 +421,107 @@ class Bot:
                         m.question[:45])
             await self._broker_call(self.broker.set_quotes, m, remaining)
 
-    async def _rescan(self, initial: bool = False) -> None:
-        log.info("scanning for reward markets…")
-        markets = await asyncio.to_thread(gamma.scan, self.cfg)
-        if not markets:
+    def _rotatable_tripped_cids(self) -> set[str]:
+        """Currently-quoted markets that are guard-tripped AND flat. These are
+        the slots worth rotating out of — a tripped market still holding
+        inventory is kept so the de-risk/exit path manages it instead of being
+        force-liquidated the moment it drops from the quote set."""
+        if not self.broker or not (self.cfg.get("scanner") or {}).get("rotate_on_trip", True):
+            return set()
+        paused = self.guards.paused_cids(time.time())
+        if not paused:
+            return set()
+        quoted = {m.condition_id: m for m in self.markets}
+        out = set()
+        for cid in paused:
+            m = quoted.get(cid)
+            if m is not None and abs(self.broker.net_yes_exposure_usd(m)) < ROTATE_FLAT_USD:
+                out.add(cid)
+        return out
+
+    def _select_markets(self, ranked: list[gamma.Market]) -> list[gamma.Market]:
+        """Pick the quote set from the full ranked candidate list, stickily.
+
+        For a reward farmer the cost of leaving a market is real (a feed/quote
+        gap, lost queue position, ramp-up on the new book), so we do NOT churn
+        the set just because the pool÷liquidity ranking reshuffled. A market we
+        are already quoting is kept as long as it stays eligible — guard-tripped
+        markets         are already removed upstream via ``exclude``, so risk signals
+        remain the primary reason a market leaves. A fresh candidate only
+        displaces a held one if it beats it by ``swap_score_margin`` AND the
+        held market is underperforming (recent in-band uptime below
+        ``underperform_uptime_pct``) — a market farming well is never evicted on
+        score alone. With no held markets (startup) this is just the top-N by
+        score, as before.
+        """
+        sc = self.cfg["scanner"]
+        top_n = int(sc["top_n_markets"])
+        if not bool(sc.get("sticky_swap", True)):
+            return ranked[:top_n]
+        margin = float(sc.get("swap_score_margin", 0.0))
+        by_cid = {m.condition_id: m for m in ranked}
+        held = [m.condition_id for m in self.markets]
+        # Currently-quoted markets still eligible this scan, freshest score first.
+        survivors = sorted((by_cid[c] for c in held if c in by_cid),
+                           key=lambda m: m.score, reverse=True)[:top_n]
+        chosen = list(survivors)
+        chosen_cids = {m.condition_id for m in chosen}
+        survivor_cids = set(chosen_cids)
+        # Backfill empty slots with the best candidates we are not already in.
+        for m in ranked:
+            if len(chosen) >= top_n:
+                break
+            if m.condition_id not in chosen_cids:
+                chosen.append(m)
+                chosen_cids.add(m.condition_id)
+        # A held market may only be evicted on score when it is BOTH (a) beaten
+        # by a materially-better candidate and (b) actually underperforming —
+        # i.e. its recent in-band uptime is low, so it isn't farming the rewards
+        # its rank implies. A market farming well at high uptime is protected
+        # regardless of how the ranking reshuffled (the anti-churn guarantee).
+        if margin > 0 and survivor_cids:
+            min_uptime = float(sc.get("underperform_uptime_pct", 60.0))
+            lookback_min = float(sc.get("underperform_lookback_minutes", 30.0))
+            uptime: dict[str, float] = {}
+            if self.metrics is not None:
+                since_min = int((time.time() - lookback_min * 60.0) // 60)
+                uptime = self.metrics.uptime_pct_by_market(since_min)
+
+            def _underperforming(cid: str) -> bool:
+                pct = uptime.get(cid)  # absent => too little history => protected
+                return pct is not None and pct < min_uptime
+
+            for cand in ranked:  # best first
+                if cand.condition_id in chosen_cids:
+                    continue
+                displaceable = [m for m in chosen
+                                if m.condition_id in survivor_cids
+                                and _underperforming(m.condition_id)]
+                if not displaceable:
+                    break  # every held market is performing — never churn
+                weak = min(displaceable, key=lambda m: m.score)
+                if cand.score < weak.score * (1.0 + margin):
+                    break  # sorted desc — nothing further clears the margin
+                chosen.remove(weak)
+                chosen.append(cand)
+                chosen_cids = (chosen_cids - {weak.condition_id}) | {cand.condition_id}
+                survivor_cids.discard(weak.condition_id)
+        return chosen
+
+    async def _rescan(self, initial: bool = False, rotate: bool = False) -> None:
+        self._rotate_pending = False
+        if rotate:
+            self._last_rotate = time.time()
+        exclude = set() if initial else self._rotatable_tripped_cids()
+        log.info("scanning for reward markets…%s",
+                 f" (rotating out {len(exclude)} tripped)" if exclude else "")
+        ranked = await asyncio.to_thread(gamma.scan, self.cfg, exclude, True)
+        if not ranked:
             if not initial:
                 log.warning("rescan found no markets; keeping current set")
             self._last_scan = time.time()
             return
+        markets = self._select_markets(ranked)
 
         old_markets = list(self.markets)
         new_cids = {m.condition_id for m in markets}
@@ -424,37 +564,43 @@ class Bot:
                 for t in new_tokens & old_tokens
                 if t in self.tracker.books
             }
-            await self.tracker.stop()
             if self.broker:
                 for t in self.broker.position_tokens():
                     if t not in token_ids:
                         token_ids.append(t)
 
-        self.tracker = BookTracker(token_ids, carry=carry_books)
-
-        if initial:
-            if self.paper:
-                p = self.cfg.get("paper") or {}
-                self.broker = PaperBroker(
-                    self.cfg["capital_usd"], self.tracker,
-                    latency_secs=float(p.get("order_latency_ms", 300)) / 1000.0)
-                self.risk = RiskManager(self.cfg, self.cfg["capital_usd"])
+        if initial or self.tracker is None:
+            self.tracker = BookTracker(token_ids, carry=carry_books)
+            if initial:
+                if self.paper:
+                    p = self.cfg.get("paper") or {}
+                    self.broker = PaperBroker(
+                        self.cfg["capital_usd"], self.tracker,
+                        latency_secs=float(p.get("order_latency_ms", 300)) / 1000.0)
+                    self.risk = RiskManager(self.cfg, self.cfg["capital_usd"])
+                else:
+                    self.broker = LiveBroker(self.cfg, self.tracker)
+                    await asyncio.to_thread(self.broker.refresh_state)
+                    self._last_pos_refresh = time.time()
+                    self.risk = RiskManager(self.cfg, self.broker.equity())
+                    from .userfeed import UserFeed
+                    self.userfeed = UserFeed(self.broker)
+                    self.userfeed.start()
             else:
-                self.broker = LiveBroker(self.cfg, self.tracker)
-                await asyncio.to_thread(self.broker.refresh_state)
-                self._last_pos_refresh = time.time()
-                self.risk = RiskManager(self.cfg, self.broker.equity())
-                from .userfeed import UserFeed
-                self.userfeed = UserFeed(self.broker)
-                self.userfeed.start()
+                self.broker.tracker = self.tracker
+                if self.paper:
+                    self.tracker.on_trade(self.broker._on_trade)
+            self.broker.metrics = self.metrics
+            self.tracker.on_trade(self._on_market_trade)
+            await self.tracker.start()
         else:
-            self.broker.tracker = self.tracker
-            if self.paper:
-                self.tracker.on_trade(self.broker._on_trade)
+            # Reuse the running tracker: incrementally resubscribe rather than
+            # tearing it down. Surviving books (and their resting reward quotes)
+            # keep ticking, only new tokens prime, and the existing trade
+            # listeners persist — no cross-market feed gap on a single swap.
+            await self.tracker.resubscribe(token_ids, carry=carry_books)
+            self.broker.metrics = self.metrics
 
-        self.broker.metrics = self.metrics
-        self.tracker.on_trade(self._on_market_trade)
-        await self.tracker.start()
         self._last_scan = time.time()
         self._compute_size_factors()
 
@@ -577,7 +723,12 @@ class Bot:
                        and any(q.token_id == m.yes_token for q in final)
                        and any(q.token_id == m.no_token for q in final))
             self.metrics.sample_uptime(m.condition_id, in_band)
-            if {q.key() for q in final} != {q.key() for q in current}:
+            # Repost when the quote actually changed OR when a resting order is
+            # near GTD expiry — otherwise a stable quote (unchanged key-set) is
+            # never re-sent through set_quotes, so it silently expires on the
+            # book and leaves a gap until the next reconcile notices it's gone.
+            changed = {q.key() for q in final} != {q.key() for q in current}
+            if changed or (final and self.broker.due_for_refresh(m)):
                 updates.append((m, final))
 
         if updates:
@@ -710,7 +861,9 @@ class Bot:
                 self.tracker.books[m.no_token],
                 self.broker.open_quotes(m),
             )
-            self.broker.accrue_rewards(m.daily_pool * share * haircut / MINUTES_PER_DAY)
+            usd = m.daily_pool * share * haircut / MINUTES_PER_DAY
+            self.broker.accrue_rewards(usd)
+            self.metrics.record_reward_sample(m.condition_id, usd)
 
     def _print_status(self) -> None:
         table = Table(title=f"pmbot — {'PAPER' if self.paper else 'LIVE'}")
@@ -738,6 +891,20 @@ class Bot:
             console.print(f"in-band uptime: {uptime:.1f}%")
         if self.controller.enabled:
             console.print(self.controller.status_line())
+        rewards = self.metrics.reward_totals()
+        hedge = self.metrics.hedge_pnl_totals()
+        console.print(
+            f"rewards realized ${rewards['realized_total']:+.2f} total / "
+            f"${rewards['realized_24h']:+.2f} 24h   "
+            f"hedge P&L (est) ${hedge['pnl_total']:+.2f} total / "
+            f"${hedge['pnl_24h']:+.2f} 24h"
+        )
+        rate = self.metrics.reward_rate_recent(60)
+        if rate["minutes"] > 0:
+            console.print(
+                f"est reward rate ${rate['usd_per_hr']:.3f}/hr "
+                f"({rate['minutes']}m sampled, ${rate['usd']:.4f})"
+            )
         eq = self.broker.equity()
         if eq != eq:
             return
