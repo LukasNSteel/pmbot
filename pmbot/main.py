@@ -647,6 +647,7 @@ class Bot:
             self.tracker.books,
             self.broker.open_quotes,
             self.cfg,
+            self.markouts,
         )
 
     async def _on_market_trade(self, token_id: str, price: float,

@@ -125,11 +125,19 @@ def compute_quotes(
 
     base_size = max(market.min_size * q["size_mult_of_min"] * scale, market.min_size)
     size = float(int(base_size * max(0.5, min(2.0, size_factor))))
+
+    # Clamp size to the per-market capital cap (size in shares ≈ USD committed
+    # at $1 pair value). We CLAMP rather than drop: when the size driver
+    # (size_mult_of_min / scale) pushes above the cap we still quote as much as
+    # the cap allows — only skip the market if even the min incentive size won't
+    # fit (the scanner already filters those, but a tier drop can shrink the cap
+    # under a held market's min size).
+    max_cap = q["max_capital_per_market"] * scale
+    if market.min_size > max_cap + 1e-9:
+        return []
+    size = min(size, float(int(max_cap)))
     # Below min_incentive_size the order scores zero rewards — never go under.
     size = max(size, float(math.ceil(market.min_size)))
-
-    if size * 1.0 > q["max_capital_per_market"] * scale:
-        return []
 
     skew_frac = max(-1.0, min(1.0, net_yes_exposure_usd / max(max_inventory_usd, 1e-9)))
     skew = skew_frac * q["skew_strength"] * offset
@@ -163,13 +171,46 @@ def reconcile_quotes(current: list[Quote], desired: list[Quote],
     return final
 
 
+def _safety_factor(market: Market, markout_cents: float | None, cfg: dict) -> float:
+    """Toxicity discount in (0, 1]: 1.0 = benign, lower = more adverse-selection
+    risk. Folds two bounded signals into per-market depth so the capital tiers
+    don't size up equally into toxic books:
+
+      * turnover (24h volume / book liquidity) — fast/informed flow proxy that is
+        always available from the scan,
+      * realized markout (cents, negative = we got picked off) once the market
+        has accumulated fills; ignored while benign or unsampled.
+
+    ``penalty = turnover_w·turnover + markout_w·max(0, -markout_cents)`` and the
+    factor is ``1/(1+penalty)``. Setting both weights to 0 disables it.
+    """
+    q = cfg["quoting"]
+    turn_w = float(q.get("size_turnover_penalty", 0.0))
+    mk_w = float(q.get("size_markout_penalty", 0.0))
+    turnover = market.volume_24h / max(market.liquidity, 100.0)
+    penalty = turn_w * turnover
+    if markout_cents is not None and markout_cents < 0:
+        penalty += mk_w * (-markout_cents)
+    return 1.0 / (1.0 + max(0.0, penalty))
+
+
 def compute_size_factors(
     markets: list[Market],
     books: dict,
     open_quotes_fn,
     cfg: dict,
+    markouts=None,
 ) -> dict[str, float]:
-    """Per-market size multiplier from estimated reward $/day per $ committed."""
+    """Per-market size multiplier from RISK-ADJUSTED reward $/day per $ committed.
+
+    The reward term is estimated capture per dollar committed (pool × our share
+    ÷ capital). It is then discounted by ``_safety_factor`` (turnover + realized
+    markout) so the depth tiers put MORE size into deep/slow markets and LESS
+    into thin/toxic ones. Factors are normalized to mean 1.0 and clamped, so this
+    REALLOCATES depth across the held markets — it does not change the absolute,
+    tier-controlled size. Pass ``markouts`` (a MarkoutTracker) to enable the
+    realized-markout term; without it only the turnover proxy applies.
+    """
     raw: dict[str, float] = {}
     for m in markets:
         yes_book = books.get(m.yes_token)
@@ -179,7 +220,13 @@ def compute_size_factors(
             continue
         share = estimate_reward_share(m, yes_book, no_book, open_quotes_fn(m))
         capital = max(m.min_size, 1.0)
-        raw[m.condition_id] = (m.daily_pool * share) / capital if capital > 0 else 0.0
+        reward = (m.daily_pool * share) / capital if capital > 0 else 0.0
+        markout_cents = None
+        if markouts is not None:
+            mo = markouts.market_avg(m.condition_id)
+            if mo is not None:
+                markout_cents = mo * 100.0
+        raw[m.condition_id] = reward * _safety_factor(m, markout_cents, cfg)
     if not raw:
         return {}
     avg = sum(raw.values()) / len(raw)

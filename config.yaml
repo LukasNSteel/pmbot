@@ -39,7 +39,14 @@ scanner:
   max_min_size_shares: 100
   # Minimum reward-pool-to-book-liquidity ratio. Higher = less crowded
   # reward dollars. 0.01 means $1/day of rewards per $100 of book liquidity.
-  min_pool_to_liquidity: 0.01
+  # Lowered from 0.01: at 0.01 this gate fought min_liquidity:5000 (deep-book
+  # floor) and left only thin books eligible — so the deep, low-toxicity
+  # political primaries the strategy prefers were all rejected for density just
+  # under the cut, while the one thin book that cleared it kept picking us off.
+  # 0.005 admits those deep primaries (we capture less reward per share there —
+  # smaller fish in a deeper pool — but the slot was otherwise empty, and the
+  # safety/uptime gain is the real PnL driver per REPORT_reward_selection.md).
+  min_pool_to_liquidity: 0.005
   # Market-selection ranking (Option C). These only re-order markets that
   # already pass the filters above (eligibility uses raw reward density), so
   # they can never starve the scanner — set both to 0 for the old ranking.
@@ -194,6 +201,19 @@ quoting:
   adaptive_markout_gain: 1.0
   adaptive_tighten_max_cents: 0.5
   adaptive_widen_max_cents: 2.0
+  # Risk-adjusted depth allocation (compute_size_factors). The per-market size
+  # multiplier discounts a market's reward-per-capital by its toxicity, so the
+  # capital tiers commit MORE size to deep/slow markets and LESS to thin/fast
+  # ones rather than sizing up equally everywhere. Penalty:
+  #   penalty = size_turnover_penalty·(volume24h/liquidity)
+  #           + size_markout_penalty·max(0, -markout_cents)
+  # and factor = 1/(1+penalty), normalized to mean 1.0 across held markets and
+  # clamped to [0.5, 2.0]. Set both to 0 to revert to reward-only allocation.
+  # turnover penalty mirrors the scanner's toxicity_turnover_penalty (0.15);
+  # markout penalty is per cent of adverse post-fill drift (0.5 = a sustained
+  # -2c markout roughly halves a market's allocated depth vs a benign peer).
+  size_turnover_penalty: 0.15
+  size_markout_penalty: 0.5
 
 guards:
   # Pull quotes from a market when its mid moves this many cents within the
@@ -369,26 +389,40 @@ controller:
     flatten_max_spread_cents: 2.0
     markout_trip_cents: -0.8
     markout_min_samples: 2
-  # Capital tiers (ascending). Bigger wallet -> more markets and larger caps;
-  # a drawdown drops to a lower tier automatically and tightens everything.
+  # Capital tiers (ascending). Bigger wallet -> larger positions FIRST, more
+  # markets only later (depth-first, per REPORT_reward_selection.md §4-5: reward
+  # is ~linear in our size while every extra market feeds the adverse-selection
+  # tail, so we scale size_mult_of_min + max_capital_per_market ahead of
+  # top_n_markets, and never quote fewer than 2 markets for diversification).
+  # A drawdown drops to a lower tier automatically and tightens everything.
+  #   size_mult_of_min     -> quote size as a multiple of each market's min size
+  #   max_capital_per_market -> hard per-market cap (shares ≈ USD); size clamps to it
   capital_tiers:
     - min_equity_usd: 0
-      top_n_markets: 1
-      max_inventory_usd_per_market: 25
+      top_n_markets: 2
+      size_mult_of_min: 1.0
+      max_capital_per_market: 50
+      max_inventory_usd_per_market: 30
       daily_loss_limit_usd: 8
       hard_kill_loss_usd: 20
     - min_equity_usd: 250
       top_n_markets: 2
-      max_inventory_usd_per_market: 50
+      size_mult_of_min: 2.0
+      max_capital_per_market: 100
+      max_inventory_usd_per_market: 60
       daily_loss_limit_usd: 20
       hard_kill_loss_usd: 50
     - min_equity_usd: 750
       top_n_markets: 3
-      max_inventory_usd_per_market: 90
+      size_mult_of_min: 3.5
+      max_capital_per_market: 175
+      max_inventory_usd_per_market: 120
       daily_loss_limit_usd: 50
       hard_kill_loss_usd: 120
     - min_equity_usd: 2000
-      top_n_markets: 4
-      max_inventory_usd_per_market: 200
+      top_n_markets: 3
+      size_mult_of_min: 6.0
+      max_capital_per_market: 300
+      max_inventory_usd_per_market: 250
       daily_loss_limit_usd: 120
       hard_kill_loss_usd: 300

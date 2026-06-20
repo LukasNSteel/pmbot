@@ -39,8 +39,13 @@ _TOXICITY_KNOBS = [
 ]
 
 # Structural knobs a capital tier may set (all read live by the bot/scanner).
+# Depth-first scaling: as equity grows we raise per-market quote size and its
+# capital cap AHEAD of the market count (see REPORT_reward_selection.md §5) —
+# reward is ~linear in our size while extra markets feed the toxic tail.
 _TIER_KNOBS = [
     ("scanner", "top_n_markets", int),
+    ("quoting", "size_mult_of_min", float),
+    ("quoting", "max_capital_per_market", float),
     ("risk", "max_inventory_usd_per_market", float),
     ("risk", "daily_loss_limit_usd", float),
     ("risk", "hard_kill_loss_usd", float),
