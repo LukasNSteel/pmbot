@@ -103,7 +103,11 @@ def test_zero_weights_reproduce_density_ranking(monkeypatch):
     assert ranked[0].condition_id == "a"  # density wins, turnover ignored
 
 
-def _fake_httpx_client(payload=None, raise_on_get=False):
+def _fake_httpx_client(payload=None, raise_on_get=False, fail_first=0):
+    # ``fail_first`` raises on the first N get() calls then succeeds — used to
+    # exercise the retry path. ``raise_on_get`` raises on every call.
+    state = {"calls": 0}
+
     class FakeResp:
         def raise_for_status(self):
             return None
@@ -122,17 +126,28 @@ def _fake_httpx_client(payload=None, raise_on_get=False):
             return False
 
         def get(self, *args, **kwargs):
-            if raise_on_get:
+            state["calls"] += 1
+            if raise_on_get or state["calls"] <= fail_first:
                 raise RuntimeError("fee api down")
             return FakeResp()
 
     return FakeClient
 
 
-def test_fee_fetch_fails_closed(monkeypatch):
+def test_fee_fetch_fails_open_assumes_zero(monkeypatch):
     monkeypatch.setattr(gamma.httpx, "Client", _fake_httpx_client(raise_on_get=True))
-    # A fetch failure returns None so scan() skips the market (fail closed).
-    assert gamma._fetch_market_fees("cid1", {}) is None
+    # Persistent failure FAILS OPEN: makers pay no fee, so we still quote the
+    # market rather than dropping it. attempts=1 keeps the test fast (no backoff).
+    assert gamma._fetch_market_fees("cid1", {}, attempts=1) == (0, 1.0)
+
+
+def test_fee_fetch_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(
+        gamma.httpx, "Client",
+        _fake_httpx_client({"fd": {"r": 0.04, "e": 1}}, fail_first=1),
+    )
+    # First call raises, retry succeeds — a transient blip must not drop the fee.
+    assert gamma._fetch_market_fees("cid1", {}, attempts=2, backoff=0.0) == (400, 1.0)
 
 
 def test_fee_fetch_parses_fd_rate_and_exponent(monkeypatch):

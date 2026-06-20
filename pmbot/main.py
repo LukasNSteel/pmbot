@@ -52,6 +52,12 @@ SCAN_RETRY_SECONDS = 60.0
 # leaving the slot idle for the whole cooldown. Debounced so a burst of trips
 # can't thrash the book-tracker (each rotation resubscribes the feed).
 ROTATE_MIN_INTERVAL_SECS = 60.0
+# When the live quote set holds fewer markets than the active tier's top_n
+# (e.g. a transient scan/API hiccup left a slot empty), rescan at this cadence
+# instead of waiting the full refresh_minutes — recovers an unfilled slot in
+# ~1-2 min rather than up to 30. Debounced so we don't rescan every loop when
+# the market universe genuinely only has fewer than top_n eligible books.
+UNFILLED_RESCAN_INTERVAL_SECS = 90.0
 # Only rotate OUT of a tripped market if it is essentially flat — a tripped
 # market still holding inventory stays in the set so the normal de-risk/exit
 # path manages it (dropping it would force an immediate liquidation).
@@ -282,7 +288,16 @@ class Bot:
             while True:
                 await asyncio.sleep(LOOP_SECONDS)
                 now = time.time()
-                if now - self._last_scan > self.cfg["scanner"]["refresh_minutes"] * 60:
+                due_refresh = (now - self._last_scan
+                               > self.cfg["scanner"]["refresh_minutes"] * 60)
+                # An unfilled slot (fewer held markets than the tier's top_n)
+                # recovers on a short cadence instead of waiting for the next
+                # full refresh — sticky selection keeps what we hold and just
+                # backfills the empty slot with the best fresh candidate.
+                top_n = int(self.cfg["scanner"]["top_n_markets"])
+                unfilled = (len(self.markets) < top_n
+                            and now - self._last_scan > UNFILLED_RESCAN_INTERVAL_SECS)
+                if due_refresh or unfilled:
                     await self._rescan()
                 elif (self._rotate_pending
                       and now - self._last_rotate > ROTATE_MIN_INTERVAL_SECS):

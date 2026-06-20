@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -103,31 +104,47 @@ def _parse_market(m: dict) -> Market | None:
 
 
 def _fetch_market_fees(
-    condition_id: str, cache: dict[str, tuple[int, float] | None]
-) -> tuple[int, float] | None:
-    """Authoritative per-market fee from the CLOB clob-markets endpoint.
+    condition_id: str, cache: dict[str, tuple[int, float] | None],
+    attempts: int = 2, backoff: float = 0.5,
+) -> tuple[int, float]:
+    """Per-market TAKER fee from the CLOB clob-markets endpoint.
 
-    Returns (taker_fee_bps, exponent), or None on failure so the caller skips
-    the market (fail closed). Polymarket charges only takers (fd.to), so this
-    rate prices crossing the spread on a merge/exit — our resting maker quotes
-    pay nothing. We read fd.r directly because the legacy /fee-rate endpoint
-    (and the mbf/tbf base-fee fields) report a flat 1000 that does not reflect
-    the real fee rate.
+    Returns (taker_fee_bps, exponent). Polymarket charges only takers (fd.to),
+    so this rate prices crossing the spread on a forced hedge or merge/exit —
+    our resting maker quotes pay nothing regardless. We read fd.r directly
+    because the legacy /fee-rate endpoint (and the mbf/tbf base-fee fields)
+    report a flat 1000 that does not reflect the real fee rate.
+
+    Robustness: the lookup is retried a few times, and on persistent failure it
+    FAILS OPEN with (0 bps, 1.0) rather than dropping the market. Since we earn
+    rewards purely as a maker (zero fee), a transient inability to read the
+    taker fee must not cost us an otherwise-good market — that previously left
+    a quoting slot empty for a full refresh cycle. The only thing we lose
+    visibility into on failure is the taker cost of a rare forced hedge/exit;
+    the ``max_fee_bps`` guard still applies whenever the rate is readable.
     """
-    if condition_id in cache:
+    if condition_id in cache and cache[condition_id] is not None:
         return cache[condition_id]
-    try:
-        with httpx.Client(timeout=5.0) as client:
-            resp = client.get(f"{CLOB_URL}/clob-markets/{condition_id}")
-            resp.raise_for_status()
-            fd = resp.json().get("fd") or {}
-        rate = float(fd.get("r") or 0.0)
-        exponent = float(fd.get("e") or 1.0)
-        result: tuple[int, float] | None = (round(rate * 10000), exponent)
-    except Exception as e:  # noqa: BLE001
-        log.warning("clob-markets fetch failed for %s…; skipping market: %s",
-                    condition_id[:12], e)
-        result = None
+    last_err: Exception | None = None
+    for i in range(max(1, attempts)):
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(f"{CLOB_URL}/clob-markets/{condition_id}")
+                resp.raise_for_status()
+                fd = resp.json().get("fd") or {}
+            rate = float(fd.get("r") or 0.0)
+            exponent = float(fd.get("e") or 1.0)
+            result = (round(rate * 10000), exponent)
+            cache[condition_id] = result
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if i + 1 < attempts:
+                time.sleep(backoff * (i + 1))
+    log.warning("clob-markets fee fetch failed for %s… after %d tries (%s); "
+                "assuming 0bps taker fee (makers pay no fee, so we still quote)",
+                condition_id[:12], attempts, last_err)
+    result = (0, 1.0)
     cache[condition_id] = result
     return result
 
@@ -225,10 +242,9 @@ def scan(cfg: dict, exclude_cids: set[str] | None = None,
             continue
         if m.min_size * 1.0 > max_capital:
             continue
-        fees = _fetch_market_fees(m.condition_id, fee_cache)
-        if fees is None:
-            continue
-        m.fee_bps, m.fee_exponent = fees
+        # Fails open to (0, 1.0) on a persistent lookup error — a missing taker
+        # fee never drops a market we can make on as a (zero-fee) maker.
+        m.fee_bps, m.fee_exponent = _fetch_market_fees(m.condition_id, fee_cache)
         if m.fee_bps > max_fee_bps:
             # Guard against pathological fee rates. Makers pay no fee on
             # Polymarket, so our reward quotes are unaffected; this only caps
