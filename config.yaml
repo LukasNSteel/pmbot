@@ -150,6 +150,7 @@ scanner:
     - musk
     - announce
     - blockade
+    - starmer
 
 quoting:
   # Where to place quotes inside the reward band, as a fraction of
