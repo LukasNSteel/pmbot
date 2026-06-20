@@ -155,6 +155,12 @@ class MarketGuards:
         self._taker_sides: dict[str, deque] = {}
         self._side_blocked_until: dict[str, float] = {}
         self._flow: dict[str, deque] = {}
+        # Correlated-bracket defense: brackets of the same neg-risk event get
+        # picked off together (e.g. every "Toy Story 5 box office between X-Y"
+        # range). When one bracket trips, the whole event is cooled down so the
+        # scanner can't immediately re-enter a sibling and bleed the same way.
+        self._event_of: dict[str, str] = {}
+        self._paused_events: dict[str, float] = {}
 
     def _load(self, cfg: dict) -> None:
         g = cfg["guards"]
@@ -181,19 +187,52 @@ class MarketGuards:
         """
         self._load(cfg)
 
+    def register_markets(self, markets) -> None:
+        """Learn condition_id -> event_id so a guard trip on one bracket can
+        cool down its sibling brackets (same neg-risk event). Markets without
+        an event_id are unaffected — event logic simply no-ops for them."""
+        for m in markets:
+            ev = getattr(m, "event_id", None)
+            if ev:
+                self._event_of[m.condition_id] = str(ev)
+
     def allow(self, cid: str, now: float) -> bool:
-        return now >= self._paused_until.get(cid, 0.0)
+        if now < self._paused_until.get(cid, 0.0):
+            return False
+        ev = self._event_of.get(cid)
+        if ev is not None and now < self._paused_events.get(ev, 0.0):
+            return False
+        return True
 
     def paused_cids(self, now: float) -> set[str]:
-        """Markets currently inside their trip cooldown (not quotable now)."""
-        return {cid for cid, until in self._paused_until.items() if now < until}
+        """Markets currently inside a trip cooldown (not quotable now) — either
+        their own or an event-level cooldown from a sibling bracket."""
+        out = {cid for cid, until in self._paused_until.items() if now < until}
+        paused_events = {ev for ev, until in self._paused_events.items() if now < until}
+        if paused_events:
+            out |= {cid for cid, ev in self._event_of.items()
+                    if ev in paused_events}
+        return out
+
+    def paused_event_ids(self, now: float) -> set[str]:
+        """Events with an active cooldown — the scanner uses this to avoid
+        entering a fresh sibling bracket of a market that just got picked off."""
+        return {ev for ev, until in self._paused_events.items() if now < until}
 
     def _trip(self, cid: str, now: float, reason: str, question: str) -> None:
-        newly_tripped = self.allow(cid, now)
+        # Base the "newly tripped" decision on this market's own timer so the
+        # immediate quote-pull callback still fires even when an event-level
+        # cooldown (from a sibling) is already in effect.
+        newly_tripped = now >= self._paused_until.get(cid, 0.0)
         if newly_tripped:
             log.warning("guard tripped (%s) — pausing '%s' for %.0f min",
                         reason, question[:50], self.cooldown / 60)
         self._paused_until[cid] = now + self.cooldown
+        ev = self._event_of.get(cid)
+        if ev is not None:
+            until = now + self.cooldown
+            if until > self._paused_events.get(ev, 0.0):
+                self._paused_events[ev] = until
         if newly_tripped and self.on_trip is not None:
             self.on_trip(cid)
 

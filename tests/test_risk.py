@@ -114,6 +114,42 @@ def test_paused_cids_reports_only_active_cooldowns():
     assert g.paused_cids(now + g.cooldown + 1) == set()
 
 
+def test_tripping_one_bracket_cools_down_sibling_event_markets():
+    g = MarketGuards(CFG)
+    now = time.time()
+    bracket_a = Market(
+        question="Toy Story 5 box office 150-160M", condition_id="cidA",
+        yes_token="ya", no_token="na", min_size=10, max_spread_cents=3,
+        daily_pool=80, liquidity=1000, volume_24h=500, tick=0.01,
+        end_date=None, neg_risk=True, event_id="evt-toy",
+    )
+    bracket_b = Market(
+        question="Toy Story 5 box office 160-170M", condition_id="cidB",
+        yes_token="yb", no_token="nb", min_size=10, max_spread_cents=3,
+        daily_pool=80, liquidity=1000, volume_24h=500, tick=0.01,
+        end_date=None, neg_risk=True, event_id="evt-toy",
+    )
+    other = Market(
+        question="Unrelated market", condition_id="cidC",
+        yes_token="yc", no_token="nc", min_size=10, max_spread_cents=3,
+        daily_pool=200, liquidity=1000, volume_24h=500, tick=0.01,
+        end_date=None, neg_risk=False, event_id="evt-other",
+    )
+    g.register_markets([bracket_a, bracket_b, other])
+
+    g.trip_market(bracket_a.condition_id, now, "test", bracket_a.question)
+    # The sibling bracket is blocked even though it never tripped itself.
+    assert not g.allow(bracket_b.condition_id, now)
+    assert "evt-toy" in g.paused_event_ids(now)
+    assert g.paused_cids(now) == {"cidA", "cidB"}
+    # An unrelated event is untouched.
+    assert g.allow(other.condition_id, now)
+    # Everything clears once the cooldown elapses.
+    later = now + g.cooldown + 1
+    assert g.allow(bracket_b.condition_id, later)
+    assert g.paused_event_ids(later) == set()
+
+
 def test_directional_flow_fires_side_block_callback():
     g = MarketGuards(CFG)
     blocked = []

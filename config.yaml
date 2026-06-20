@@ -22,8 +22,12 @@ scanner:
   # free balance at once. At $100 capital, 1–2 markets is realistic; raise
   # this only as you add capital.
   top_n_markets: 2
-  # Ignore markets whose daily reward pool is below this (USD/day).
-  min_pool_per_day: 75
+  # Ignore markets whose daily reward pool is below this (USD/day). Raised
+  # from 75: a thin pool (e.g. an $82/day box-office bracket) earns only cents
+  # of reward share at our size while still carrying full pick-off/forced-hedge
+  # risk — a losing trade. Better to quote one strong market than backfill the
+  # second slot with a toxic low-pool one. Lower only if the scanner starves.
+  min_pool_per_day: 120
   # Absolute book-liquidity floor (USD). The reward-density ranking below
   # (pool ÷ liquidity) structurally favors THIN books, which then trip the
   # volatility / book-not-quotable guards and tank in-band uptime (e.g. a $431
@@ -44,7 +48,7 @@ scanner:
   #     score *= 1 / (1 + w * volume24h/liquidity).
   #   band_room_bonus: prefer wider reward bands (more room to quote inside and
   #     still merge pairs near $1.00). score *= 1 + w * (max_spread_cents - 1).
-  toxicity_turnover_penalty: 0.05
+  toxicity_turnover_penalty: 0.15
   band_room_bonus: 0.10
   # Hard cap on market fee rate (basis points), as reported by the CLOB
   # /fee-rate endpoint. On Polymarket makers are NEVER charged fees, so our
@@ -331,8 +335,12 @@ metrics:
 # (no restart needed). Set enabled: false to pin config to the static values.
 controller:
   enabled: true
-  # How often to re-evaluate (first evaluation runs at startup).
-  interval_minutes: 10
+  # How often to re-evaluate (first evaluation runs at startup). Shortened from
+  # 10: with a 10-min cadence the controller stayed on the calm anchors through
+  # an entire pick-off episode (seen live quoting tight at offset 0.30 into a
+  # -12c markout). 5 min lets it widen/extend hedging while flow is still toxic;
+  # `smoothing` still keeps each step gradual.
+  interval_minutes: 5
   # Fraction of the gap to a knob's target applied each evaluation (0..1).
   # Lower = smoother/slower adaptation; 1.0 = jump straight to target.
   smoothing: 0.5
@@ -341,7 +349,11 @@ controller:
   markout_calm_cents: 0.0
   markout_toxic_cents: -3.0
   # Ignore the markout signal until at least this many fills are in the window.
-  min_markout_samples: 4
+  # Lowered from 4: a toxic burst is often only a handful of fills, and waiting
+  # for 4 left the controller reading "toxicity 0%" while it was already being
+  # picked off at -12c (n=2). 2 reacts on the early evidence; `smoothing` and
+  # the per-market markout guard still damp any overreaction.
+  min_markout_samples: 2
   # Calm flow: quote tight, hedge fast, capture reward share.
   calm:
     offset_frac_of_max_spread: 0.30

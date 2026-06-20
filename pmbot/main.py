@@ -521,6 +521,26 @@ class Bot:
                 log.warning("rescan found no markets; keeping current set")
             self._last_scan = time.time()
             return
+        # Teach the guards which event each candidate belongs to, then refuse to
+        # enter a fresh bracket whose event has a sibling in guard cooldown —
+        # correlated neg-risk brackets pick off makers together, so re-entering
+        # one mid-cooldown just repeats the loss. Markets we already quote are
+        # kept (their inventory is wound down by the de-risk/exit path).
+        self.guards.register_markets(ranked)
+        held_cids = {m.condition_id for m in self.markets}
+        paused_events = self.guards.paused_event_ids(time.time())
+        if paused_events:
+            ranked = [
+                m for m in ranked
+                if getattr(m, "event_id", None) not in paused_events
+                or m.condition_id in held_cids
+            ]
+            if not ranked:
+                if not initial:
+                    log.warning("rescan found only cooled-down markets; "
+                                "keeping current set")
+                self._last_scan = time.time()
+                return
         markets = self._select_markets(ranked)
 
         old_markets = list(self.markets)
