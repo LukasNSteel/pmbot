@@ -100,15 +100,17 @@ def cmd_report(cfg: dict) -> None:
     store = _metrics_store(cfg)
     report = store.daily_report()
     rewards = store.reward_totals()
-    hedge = store.hedge_pnl_totals()
+    ledger = store.trading_pnl_ledger()
     store.close()
     table = Table(title=f"PnL report — {report['date']}")
     table.add_column("Component")
     table.add_column("USD")
     for key, label in [
-        ("spread_capture_usd", "Spread capture (merges)"),
-        ("hedge_cost_usd", "Forced hedge cost"),
+        ("merge_proceeds_usd", "Merge proceeds (gross, $1/pair)"),
+        ("buys_usd", "Buys (gross cash out)"),
+        ("sells_usd", "Exits/sells (gross cash in)"),
         ("fees_usd", "Fees paid"),
+        ("trading_pnl_usd", "Trading P&L (net, ledger)"),
         ("est_rewards_usd", "Est. rewards"),
         ("realized_rewards_usd", "Realized rewards"),
         ("equity_pnl_usd", "Equity PnL"),
@@ -118,23 +120,25 @@ def cmd_report(cfg: dict) -> None:
     table.add_row("In-band uptime", f"{report['uptime_pct']:.1f}%")
     console.print(table)
 
-    score = Table(title="Scoreboard — rewards vs hedge cost")
+    score = Table(title="Scoreboard — rewards vs trading P&L")
     score.add_column("Metric")
     score.add_column("All-time", justify="right")
     score.add_column("Last 24h", justify="right")
     score.add_row("Realized rewards (exact)",
                   f"${rewards['realized_total']:+.2f}",
                   f"${rewards['realized_24h']:+.2f}")
-    score.add_row("Hedge P&L (est., forced pairings)",
-                  f"${hedge['pnl_total']:+.2f}",
-                  f"${hedge['pnl_24h']:+.2f}")
+    score.add_row("Trading P&L (ledger: merges+sells-buys-fees)",
+                  f"${ledger['mtm_total']:+.2f} mtm",
+                  f"${ledger['realized_24h']:+.2f}")
     console.print(score)
     console.print(
-        f"[dim]Realized rewards are exact cash. Hedge P&L is an ESTIMATE of the "
-        f"loss on completable forced pairs (gross taker spend "
-        f"${hedge['spend_total']:.0f} all-time / ${hedge['spend_24h']:.0f} 24h); "
-        f"lot-level pairing isn't logged, so treat it as indicative. Compare "
-        f"deposits vs wallet balance for the audited bottom line.[/]"
+        f"[dim]Both figures are from logged cashflows. Trading P&L (ledger) is the "
+        f"ground-truth match for your Polymarket history (sum of +/- trades - "
+        f"deposits - rewards): realized ${ledger['realized_total']:+.2f} all-time "
+        f"plus the current inventory mark ${ledger['inventory_usd']:.2f} = "
+        f"${ledger['mtm_total']:+.2f} mark-to-market. Realized 24h reads low while "
+        f"bought pairs await merge/resolution. For the audited bottom line compare "
+        f"deposits vs wallet balance.[/]"
     )
 
 
@@ -928,12 +932,12 @@ class Bot:
         if self.controller.enabled:
             console.print(self.controller.status_line())
         rewards = self.metrics.reward_totals()
-        hedge = self.metrics.hedge_pnl_totals()
+        ledger = self.metrics.trading_pnl_ledger()
         console.print(
             f"rewards realized ${rewards['realized_total']:+.2f} total / "
             f"${rewards['realized_24h']:+.2f} 24h   "
-            f"hedge P&L (est) ${hedge['pnl_total']:+.2f} total / "
-            f"${hedge['pnl_24h']:+.2f} 24h"
+            f"trading P&L (ledger) ${ledger['mtm_total']:+.2f} mtm / "
+            f"${ledger['realized_24h']:+.2f} 24h"
         )
         rate = self.metrics.reward_rate_recent(60)
         if rate["minutes"] > 0:

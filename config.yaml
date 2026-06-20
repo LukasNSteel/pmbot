@@ -144,6 +144,15 @@ scanner:
     # Valuation-tracking books (e.g. "SpaceX market cap between $2.5T and $3T")
     # jump on discrete funding/IPO news that picks off resting quotes.
     - market cap
+    # IPO-timing books resolve on discrete funding/listing announcements — the
+    # same headline pick-off as market-cap books (Anthropic IPO cost −$5.75).
+    - ipo
+    # Box-office bracket books: the mid tracks an external observation (opening-
+    # weekend gross) that informed traders price faster than we can pull quotes.
+    # This was the single LARGEST loss source (Toy Story 5, −$49.61 across three
+    # brackets) yet was never keyword-excluded — see scripts/backtest.py.
+    - box office
+    - toy story
     # Price-touch / barrier books phrased "... hit (LOW)/(HIGH) $X": a continuous
     # external price crossing a fixed level is pure adverse selection for a maker.
     - "hit (low)"

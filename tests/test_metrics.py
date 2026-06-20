@@ -219,6 +219,39 @@ def test_hedge_pnl_uses_maker_basis(tmp_path):
     assert out["shares_total"] == 10
 
 
+def test_trading_pnl_ledger_reconciles_cashflows(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+    ts = time.time()
+    # Assemble one 10-pair batch: buy YES @0.46 and NO @0.56 (cost 1.02/pair),
+    # then merge 10 pairs ($1 each). Net = 10*1 - (4.6 + 5.6) = -0.20.
+    store.record_fill({"ts": ts, "cid": "c", "market": "M", "side": "YES",
+                       "token": "y", "price": 0.46, "size": 10})
+    store.record_fill({"ts": ts, "cid": "c", "market": "M", "side": "NO",
+                       "token": "n", "price": 0.56, "size": 10, "taker": True})
+    store.record_merge("c", 10)
+    # A reduce-only exit sells 2 shares @0.48 (cash in), and a fee is charged.
+    store.record_fill({"ts": ts, "cid": "c", "market": "M", "side": "YES",
+                       "token": "y", "price": 0.48, "size": 2, "exit": True,
+                       "fee": 0.01})
+    # Inventory mark for the mark-to-market line.
+    store.record_equity(100.0, 3.5)
+    out = store.trading_pnl_ledger()
+    store.close()
+    # merges 10 + sells 0.96 - buys 10.20 - fees 0.01 = +0.75
+    assert abs(out["realized_total"] - 0.75) < 1e-9
+    assert abs(out["realized_24h"] - 0.75) < 1e-9
+    assert abs(out["inventory_usd"] - 3.5) < 1e-9
+    assert abs(out["mtm_total"] - (0.75 + 3.5)) < 1e-9
+
+
+def test_trading_pnl_ledger_empty(tmp_path):
+    store = MetricsStore(str(tmp_path / "test.db"))
+    out = store.trading_pnl_ledger()
+    store.close()
+    assert out == {"realized_total": 0.0, "realized_24h": 0.0,
+                   "inventory_usd": 0.0, "mtm_total": 0.0}
+
+
 def test_inception_date_prunes_and_blocks(tmp_path):
     db = tmp_path / "test.db"
     # Seed pre-inception rows without the floor.

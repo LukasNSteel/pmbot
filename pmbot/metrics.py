@@ -408,6 +408,20 @@ class MetricsStore:
             (day_start, day_end),
         ).fetchone()[0]
 
+        # Net trading P&L from the cash ledger (merges + sells - buys - fees) —
+        # the ground truth, vs the gross component figures above.
+        buys = self._conn.execute(
+            "SELECT COALESCE(SUM(price*size),0) FROM fills "
+            "WHERE ts>=? AND ts<? AND exit=0",
+            (day_start, day_end),
+        ).fetchone()[0]
+        sells = self._conn.execute(
+            "SELECT COALESCE(SUM(price*size),0) FROM fills "
+            "WHERE ts>=? AND ts<? AND exit=1",
+            (day_start, day_end),
+        ).fetchone()[0]
+        trading_pnl = merges + sells - buys - fees
+
         est_rewards = self._conn.execute(
             "SELECT COALESCE(SUM(estimated),0) FROM rewards WHERE date=?",
             (date,),
@@ -440,6 +454,10 @@ class MetricsStore:
 
         return {
             "date": date,
+            "merge_proceeds_usd": merges,
+            "buys_usd": buys,
+            "sells_usd": sells,
+            "trading_pnl_usd": trading_pnl,
             "spread_capture_usd": merges,
             "hedge_cost_usd": hedge_cost,
             "fees_usd": -fees,
@@ -538,6 +556,60 @@ class MetricsStore:
                 hpx24 = a["pv24"] / a["sz24"]
                 out["pnl_24h"] += min(a["sz24"], held) * (1.0 - hpx24 - basis)
         return out
+
+    def trading_pnl_ledger(self) -> dict:
+        """Ground-truth realized trading P&L from the cash ledger.
+
+        Reconciles the ACTUAL logged cashflows the way the Polymarket trade
+        history does, rather than estimating forced-hedge pairing loss like
+        ``hedge_pnl_totals`` (which assumes a basis and caps loss-bearing
+        pairs, and was found to understate the real loss ~2x):
+
+            realized = merges($1/pair) + exits(sells) - buys - fees
+
+        Every fill with ``exit=0`` is cash OUT (maker reward quotes AND taker
+        forced hedges); every ``exit=1`` fill is cash IN; each merged pair
+        returns $1. Rewards and deposits are EXCLUDED — they are not trading
+        P&L. ``mtm_total`` adds the latest inventory mark so open (bought but
+        not-yet-merged) pairs aren't counted as pure loss; ``realized_*`` treat
+        held inventory as sunk, so short windows read low until those pairs
+        merge/resolve. This is the apples-to-apples match for your Polymarket
+        history (sum of +/- trades - deposits - rewards).
+
+        Caveat: positions that resolved and redeemed at $1 without a logged
+        merge are not captured here, which would make the ledger look slightly
+        worse than reality; with ``merge_enabled`` this should be small.
+        """
+        def _cash(since: float | None) -> float:
+            extra = "" if since is None else " AND ts >= ?"
+            args = () if since is None else (since,)
+            margs = () if since is None else (since,)
+            buys = self._conn.execute(
+                "SELECT COALESCE(SUM(price*size),0) FROM fills WHERE exit=0" + extra,
+                args).fetchone()[0] or 0.0
+            sells = self._conn.execute(
+                "SELECT COALESCE(SUM(price*size),0) FROM fills WHERE exit=1" + extra,
+                args).fetchone()[0] or 0.0
+            fees = self._conn.execute(
+                "SELECT COALESCE(SUM(fee),0) FROM fills"
+                + ("" if since is None else " WHERE ts >= ?"), margs).fetchone()[0] or 0.0
+            merge_cash = self._conn.execute(
+                "SELECT COALESCE(SUM(pairs),0) FROM merges"
+                + ("" if since is None else " WHERE ts >= ?"), margs).fetchone()[0] or 0.0
+            return merge_cash + sells - buys - fees
+
+        inv_row = self._conn.execute(
+            "SELECT inventory_usd FROM equity ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        inv = float(inv_row[0]) if inv_row and inv_row[0] is not None else 0.0
+        realized_total = _cash(None)
+        realized_24h = _cash(time.time() - 86400)
+        return {
+            "realized_total": realized_total,
+            "realized_24h": realized_24h,
+            "inventory_usd": inv,
+            "mtm_total": realized_total + inv,
+        }
 
     def recent_fills(self, limit: int = 50, since_ts: float | None = None,
                      cid: str | None = None) -> list[dict]:
